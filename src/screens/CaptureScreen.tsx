@@ -17,10 +17,15 @@ import { insertSubmission, openDatabase, SubmissionRecord, GuestDocumentRecord }
 import { syncPendingUploads } from '../services/syncManager';
 
 /**
- * Metadata definition for each of the 4 required document captures.
+ * Metadata definition for each of the 5 required capture steps:
+ * 1. Passport Bio-Data Page
+ * 2. Visa Page or OCI Card
+ * 3. Entry Immigration Stamp
+ * 4. Handwritten Form-C Arrival Report
+ * 5. Dedicated Guest Portrait Photo (Option B: kept local for Form-C portal upload)
  */
 interface DocumentStep {
-  key: 'passport' | 'visa' | 'stamp' | 'form_c';
+  key: 'passport' | 'visa' | 'stamp' | 'form_c' | 'guest_photo';
   title: string;
   description: string;
 }
@@ -46,6 +51,11 @@ const DOCUMENT_STEPS: DocumentStep[] = [
     title: '4. Form-C Arrival Report',
     description: 'Capture the physical handwritten arrival report sheet filled by the guest.',
   },
+  {
+    key: 'guest_photo',
+    title: '5. Guest Portrait Photo',
+    description: 'Capture a clear passport-style portrait of the guest. Stored locally for Form-C portal upload.',
+  },
 ];
 
 interface CaptureScreenProps {
@@ -67,7 +77,7 @@ export const CaptureScreen: React.FC<CaptureScreenProps> = ({ onCaptureComplete,
   const activeImageUri = capturedImages[activeStep.key];
 
   /**
-   * Launches the device camera to take a document photo.
+   * Launches the device camera using modern ImagePicker.MediaType to avoid deprecation warnings.
    */
   const handleTakePhoto = async () => {
     const permissionResult = await ImagePicker.requestCameraPermissionsAsync();
@@ -78,7 +88,7 @@ export const CaptureScreen: React.FC<CaptureScreenProps> = ({ onCaptureComplete,
     }
 
     const result = await ImagePicker.launchCameraAsync({
-      mediaTypes: ImagePicker.MediaTypeOptions.Images,
+      mediaTypes: ['images'],
       quality: 0.85,
       allowsEditing: false,
     });
@@ -130,7 +140,7 @@ export const CaptureScreen: React.FC<CaptureScreenProps> = ({ onCaptureComplete,
         updated_at: now,
       };
 
-      // Prepare GuestDocument entity
+      // Prepare GuestDocument entity including local guest_photo_path
       const newGuestDoc: GuestDocumentRecord = {
         id: docRecordId,
         submission_id: submissionId,
@@ -139,12 +149,13 @@ export const CaptureScreen: React.FC<CaptureScreenProps> = ({ onCaptureComplete,
         visa_stamp_path: persistedPaths['visa'],
         entry_stamp_path: persistedPaths['stamp'],
         form_c_path: persistedPaths['form_c'],
+        guest_photo_path: persistedPaths['guest_photo'],
       };
 
       // 1. Insert into local SQLite database
       await insertSubmission(newSubmission, [newGuestDoc]);
 
-      // 2. Trigger detached background upload without waiting
+      // 2. Trigger detached background upload for documents without blocking UI
       syncPendingUploads().catch((err) =>
         console.warn('[CaptureScreen] Detached sync triggered with error:', err)
       );
@@ -192,7 +203,7 @@ export const CaptureScreen: React.FC<CaptureScreenProps> = ({ onCaptureComplete,
           />
         </View>
 
-        {/* Guided Step Indicator */}
+        {/* Guided Step Indicator (1 to 5) */}
         <View style={styles.stepIndicatorContainer}>
           {DOCUMENT_STEPS.map((step, idx) => {
             const isCompleted = !!capturedImages[step.key];
@@ -245,7 +256,9 @@ export const CaptureScreen: React.FC<CaptureScreenProps> = ({ onCaptureComplete,
             ) : (
               <View style={styles.emptyPreview}>
                 <Text style={[styles.emptyPreviewText, { color: colors.textMuted }]}>
-                  No photo captured yet
+                  {activeStep.key === 'guest_photo'
+                    ? 'No guest portrait captured yet'
+                    : 'No document captured yet'}
                 </Text>
               </View>
             )}
@@ -284,7 +297,7 @@ export const CaptureScreen: React.FC<CaptureScreenProps> = ({ onCaptureComplete,
               onPress={() => setCurrentStepIndex((prev) => prev + 1)}
               style={[styles.navButton, { backgroundColor: colors.primaryBrand }]}
             >
-              <Text style={styles.navButtonPrimaryText}>Next Document</Text>
+              <Text style={styles.navButtonPrimaryText}>Next Step</Text>
             </TouchableOpacity>
           ) : (
             <TouchableOpacity
@@ -359,7 +372,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'space-between',
     marginBottom: 16,
-    paddingHorizontal: 16,
+    paddingHorizontal: 8,
   },
   stepBadge: {
     width: 44,
@@ -370,7 +383,7 @@ const styles = StyleSheet.create({
     borderWidth: 1,
   },
   stepBadgeText: {
-    fontSize: 16,
+    fontSize: 15,
     fontWeight: '700',
   },
   stepTitle: {
