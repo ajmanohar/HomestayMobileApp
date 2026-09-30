@@ -17,11 +17,13 @@ import { submitGuestDocuments } from '../services/apiService';
 interface DashboardScreenProps {
   onStartNewCapture: () => void;
   onOpenReview: (submissionId: string) => void;
+  onOpenPortal: (submissionId: string) => void;
 }
 
 export const DashboardScreen: React.FC<DashboardScreenProps> = ({
   onStartNewCapture,
   onOpenReview,
+  onOpenPortal,
 }) => {
   const { colors, isDark, toggleTheme } = useAppTheme();
 
@@ -52,11 +54,11 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
   const handleRefresh = async () => {
     setRefreshing(true);
     try {
-      // Run background upload and polling jobs
+      console.log('[Dashboard] Manual pull-to-refresh triggered.');
       await runFullSync();
-      // Refresh local list
       await loadSubmissions();
     } catch (error: any) {
+      console.warn('[Dashboard] Pull-to-refresh error:', error);
       Alert.alert('Sync Notice', error.message || 'Unable to sync with remote server.');
     } finally {
       setRefreshing(false);
@@ -65,39 +67,49 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
 
   /**
    * Allows manual single-card retry when a submission is stuck in UPLOAD_PENDING.
-   * Shows an explicit error alert to the operator if the server (or tunnel) fails.
    *
    * @param item - The target submission record to retry
    */
   const handleRetryUpload = async (item: SubmissionRecord) => {
+    if (!item || !item.id) {
+      Alert.alert('Error', 'Invalid submission record ID.');
+      return;
+    }
+
     try {
       setRetryingId(item.id);
+      console.log(`[Dashboard] Starting retry upload for submission ID: ${item.id}`);
+
       const db = await openDatabase();
+      const safeSubmissionId = String(item.id).trim();
 
       // 1. Fetch document record associated with this submission
       const docs = await db.getAllAsync<GuestDocumentRecord>(
-        `SELECT * FROM guest_documents WHERE submission_id = ? ORDER BY guest_index ASC LIMIT 1;`,
-        [item.id]
+        'SELECT * FROM guest_documents WHERE submission_id = ? LIMIT 1;',
+        [safeSubmissionId]
       );
 
-      if (docs.length === 0) {
+      if (!docs || docs.length === 0) {
         Alert.alert('Error', 'No document images found for this submission.');
         return;
       }
 
       const guestDoc = docs[0];
+      console.log(`[Dashboard] Found document: ${guestDoc.passport_bio_path}`);
 
-      // 2. Post multipart upload to backend API
+      // 2. Post multipart upload to backend API (guest_photo remains local on-device)
       const response = await submitGuestDocuments(
         guestDoc.passport_bio_path,
-        guestDoc.visa_stamp_path,
-        guestDoc.entry_stamp_path,
-        guestDoc.form_c_path,
-        item.reference
+        guestDoc.visa_stamp_path ?? undefined,
+        guestDoc.entry_stamp_path ?? undefined,
+        guestDoc.form_c_path ?? undefined,
+        item.reference ?? undefined
       );
 
+      console.log(`[Dashboard] Upload succeeded with job_id: ${response.job_id}`);
+
       // 3. On success, advance status to PROCESSING with returned job_id
-      await updateSubmissionStatus(item.id, 'PROCESSING', response.job_id);
+      await updateSubmissionStatus(safeSubmissionId, 'PROCESSING', response.job_id);
       await loadSubmissions();
 
       Alert.alert(
@@ -105,7 +117,7 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
         `Job registered on server with ID: ${response.job_id}. Processing has started.`
       );
     } catch (error: any) {
-      // Explicitly notify operator of server/tunnel downtime instead of failing silently
+      console.error(`[Dashboard] Retry upload failed for ${item.id}:`, error);
       Alert.alert(
         'Upload Failed',
         `Server communication failed: ${error.message || error}.\n\nPlease ensure your server and Cloudflare tunnel are active, then tap to retry.`
@@ -157,11 +169,14 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
 
   /**
    * Card press router:
+   * - If REVIEWED: opens the Form-C portal runner screen.
    * - If PENDING_REVIEW: opens split-screen verification.
-   * - If UPLOAD_PENDING: triggers immediate retry upload with operator feedback.
+   * - If UPLOAD_PENDING: triggers immediate retry upload.
    */
   const handleCardPress = (item: SubmissionRecord) => {
-    if (item.status === 'PENDING_REVIEW') {
+    if (item.status === 'REVIEWED') {
+      onOpenPortal(item.id);
+    } else if (item.status === 'PENDING_REVIEW') {
       onOpenReview(item.id);
     } else if (item.status === 'UPLOAD_PENDING') {
       handleRetryUpload(item);
@@ -174,6 +189,7 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
   const renderSubmissionItem = ({ item }: { item: SubmissionRecord }) => {
     const badge = getStatusBadgeStyle(item.status);
     const isReadyForReview = item.status === 'PENDING_REVIEW';
+    const isReviewed = item.status === 'REVIEWED';
     const isUploadPending = item.status === 'UPLOAD_PENDING';
     const isThisCardRetrying = retryingId === item.id;
 
@@ -222,6 +238,10 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
             <Text style={[styles.actionPromptText, { color: colors.statusReady }]}>
               Tap to Verify →
             </Text>
+          ) : isReviewed ? (
+            <Text style={[styles.actionPromptText, { color: colors.statusDone }]}>
+              Open Form-C Portal ↗
+            </Text>
           ) : (
             <Text style={[styles.actionPromptText, { color: colors.textMuted }]}>
               {item.status}
@@ -268,7 +288,7 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
             <View style={styles.emptyContainer}>
               <Text style={[styles.emptyTitle, { color: colors.textPrimary }]}>No captures yet</Text>
               <Text style={[styles.emptySubtitle, { color: colors.textMuted }]}>
-                Tap the button below to capture the 4 guest documents.
+                Tap the button below to capture the guest documents.
               </Text>
             </View>
           }
