@@ -7,10 +7,12 @@ import {
   FlatList,
   RefreshControl,
   ActivityIndicator,
+  Alert,
 } from 'react-native';
 import { useAppTheme } from '../theme/ThemeContext';
-import { getAllSubmissions, SubmissionRecord, SubmissionStatus } from '../db/database';
+import { getAllSubmissions, openDatabase, updateSubmissionStatus, SubmissionRecord, GuestDocumentRecord, SubmissionStatus } from '../db/database';
 import { runFullSync } from '../services/syncManager';
+import { submitGuestDocuments } from '../services/apiService';
 
 interface DashboardScreenProps {
   onStartNewCapture: () => void;
@@ -27,6 +29,7 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
   const [submissions, setSubmissions] = useState<SubmissionRecord[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [refreshing, setRefreshing] = useState<boolean>(false);
+  const [retryingId, setRetryingId] = useState<string | null>(null);
 
   /**
    * Queries local SQLite database to load recent guest submissions.
@@ -49,24 +52,76 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
   const handleRefresh = async () => {
     setRefreshing(true);
     try {
-      // 1. Fire background upload and polling jobs
+      // Run background upload and polling jobs
       await runFullSync();
-      // 2. Refresh local records
+      // Refresh local list
       await loadSubmissions();
-    } catch (error) {
-      console.warn('[Dashboard] Sync runner failed:', error);
+    } catch (error: any) {
+      Alert.alert('Sync Notice', error.message || 'Unable to sync with remote server.');
     } finally {
       setRefreshing(false);
     }
   };
 
-  // Load submissions on mount
+  /**
+   * Allows manual single-card retry when a submission is stuck in UPLOAD_PENDING.
+   * Shows an explicit error alert to the operator if the server (or tunnel) fails.
+   *
+   * @param item - The target submission record to retry
+   */
+  const handleRetryUpload = async (item: SubmissionRecord) => {
+    try {
+      setRetryingId(item.id);
+      const db = await openDatabase();
+
+      // 1. Fetch document record associated with this submission
+      const docs = await db.getAllAsync<GuestDocumentRecord>(
+        `SELECT * FROM guest_documents WHERE submission_id = ? ORDER BY guest_index ASC LIMIT 1;`,
+        [item.id]
+      );
+
+      if (docs.length === 0) {
+        Alert.alert('Error', 'No document images found for this submission.');
+        return;
+      }
+
+      const guestDoc = docs[0];
+
+      // 2. Post multipart upload to backend API
+      const response = await submitGuestDocuments(
+        guestDoc.passport_bio_path,
+        guestDoc.visa_stamp_path,
+        guestDoc.entry_stamp_path,
+        guestDoc.form_c_path,
+        item.reference
+      );
+
+      // 3. On success, advance status to PROCESSING with returned job_id
+      await updateSubmissionStatus(item.id, 'PROCESSING', response.job_id);
+      await loadSubmissions();
+
+      Alert.alert(
+        'Upload Successful',
+        `Job registered on server with ID: ${response.job_id}. Processing has started.`
+      );
+    } catch (error: any) {
+      // Explicitly notify operator of server/tunnel downtime instead of failing silently
+      Alert.alert(
+        'Upload Failed',
+        `Server communication failed: ${error.message || error}.\n\nPlease ensure your server and Cloudflare tunnel are active, then tap to retry.`
+      );
+    } finally {
+      setRetryingId(null);
+    }
+  };
+
+  // Initial mount load
   useEffect(() => {
     loadSubmissions();
   }, [loadSubmissions]);
 
   /**
-   * Helper returning semantic status pill colors based on current state.
+   * Semantic badge visual configuration.
    */
   const getStatusBadgeStyle = (status: SubmissionStatus) => {
     switch (status) {
@@ -84,7 +139,7 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
   };
 
   /**
-   * Formats ISO timestamp into human-readable date.
+   * Formats ISO timestamp into readable date and time.
    */
   const formatDate = (isoString: string): string => {
     try {
@@ -101,20 +156,31 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
   };
 
   /**
-   * Renders an individual submission item styled like an Amazon order/Alexa routine card.
+   * Card press router:
+   * - If PENDING_REVIEW: opens split-screen verification.
+   * - If UPLOAD_PENDING: triggers immediate retry upload with operator feedback.
+   */
+  const handleCardPress = (item: SubmissionRecord) => {
+    if (item.status === 'PENDING_REVIEW') {
+      onOpenReview(item.id);
+    } else if (item.status === 'UPLOAD_PENDING') {
+      handleRetryUpload(item);
+    }
+  };
+
+  /**
+   * Renders each individual submission item with explicit feedback cues.
    */
   const renderSubmissionItem = ({ item }: { item: SubmissionRecord }) => {
     const badge = getStatusBadgeStyle(item.status);
     const isReadyForReview = item.status === 'PENDING_REVIEW';
+    const isUploadPending = item.status === 'UPLOAD_PENDING';
+    const isThisCardRetrying = retryingId === item.id;
 
     return (
       <TouchableOpacity
         activeOpacity={0.7}
-        onPress={() => {
-          if (isReadyForReview) {
-            onOpenReview(item.id);
-          }
-        }}
+        onPress={() => handleCardPress(item)}
         style={[
           styles.submissionCard,
           {
@@ -134,7 +200,7 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
 
         <View style={styles.cardMetaRow}>
           <Text style={[styles.metaLabel, { color: colors.textMuted }]}>
-            ID: <Text style={{ color: colors.textPrimary }}>{item.id.slice(0, 14)}...</Text>
+            ID: <Text style={{ color: colors.textPrimary }}>{item.id.slice(0, 16)}...</Text>
           </Text>
           <Text style={[styles.metaLabel, { color: colors.textMuted }]}>
             {item.guest_count} Guest{item.guest_count > 1 ? 's' : ''}
@@ -145,9 +211,20 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
           <Text style={[styles.dateText, { color: colors.textMuted }]}>
             {formatDate(item.created_at)}
           </Text>
-          {isReadyForReview && (
-            <Text style={[styles.reviewActionText, { color: colors.statusReady }]}>
+
+          {isThisCardRetrying ? (
+            <ActivityIndicator size="small" color={colors.accent} />
+          ) : isUploadPending ? (
+            <Text style={[styles.actionPromptText, { color: colors.accent }]}>
+              Tap to Retry Upload ⟳
+            </Text>
+          ) : isReadyForReview ? (
+            <Text style={[styles.actionPromptText, { color: colors.statusReady }]}>
               Tap to Verify →
+            </Text>
+          ) : (
+            <Text style={[styles.actionPromptText, { color: colors.textMuted }]}>
+              {item.status}
             </Text>
           )}
         </View>
@@ -198,7 +275,7 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
         />
       )}
 
-      {/* Floating Bottom Sticky Action Bar (Amazon / Alexa Style) */}
+      {/* Floating Bottom Sticky Action Bar */}
       <View style={[styles.bottomBarContainer, { backgroundColor: colors.surface, borderTopColor: colors.border }]}>
         <TouchableOpacity
           onPress={onStartNewCapture}
@@ -293,7 +370,7 @@ const styles = StyleSheet.create({
   dateText: {
     fontSize: 12,
   },
-  reviewActionText: {
+  actionPromptText: {
     fontSize: 13,
     fontWeight: '600',
   },
