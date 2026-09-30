@@ -8,11 +8,25 @@ import {
   RefreshControl,
   ActivityIndicator,
   Alert,
+  Modal,
+  TextInput,
 } from 'react-native';
 import { useAppTheme } from '../theme/ThemeContext';
-import { getAllSubmissions, openDatabase, updateSubmissionStatus, SubmissionRecord, GuestDocumentRecord, SubmissionStatus } from '../db/database';
+import {
+  getAllSubmissions,
+  openDatabase,
+  updateSubmissionStatus,
+  SubmissionRecord,
+  GuestDocumentRecord,
+  SubmissionStatus,
+} from '../db/database';
 import { runFullSync } from '../services/syncManager';
 import { submitGuestDocuments } from '../services/apiService';
+import {
+  getPortalCredentials,
+  savePortalCredentials,
+  clearPortalCredentials,
+} from '../services/credentialService';
 
 interface DashboardScreenProps {
   onStartNewCapture: () => void;
@@ -27,11 +41,17 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
 }) => {
   const { colors, isDark, toggleTheme } = useAppTheme();
 
-  // Screen state
+  // Screen queue state
   const [submissions, setSubmissions] = useState<SubmissionRecord[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [refreshing, setRefreshing] = useState<boolean>(false);
   const [retryingId, setRetryingId] = useState<string | null>(null);
+
+  // Portal credentials modal state
+  const [isCredsModalVisible, setIsCredsModalVisible] = useState<boolean>(false);
+  const [portalUserId, setPortalUserId] = useState<string>('');
+  const [portalPassword, setPortalPassword] = useState<string>('');
+  const [isSavingCreds, setIsSavingCreds] = useState<boolean>(false);
 
   /**
    * Queries local SQLite database to load recent guest submissions.
@@ -66,6 +86,56 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
   };
 
   /**
+   * Opens the credentials modal and pre-loads stored values from SecureStore.
+   */
+  const handleOpenCredentialsModal = async () => {
+    try {
+      const creds = await getPortalCredentials();
+      setPortalUserId(creds.userId || '');
+      setPortalPassword(creds.password || '');
+      setIsCredsModalVisible(true);
+    } catch (error) {
+      console.warn('[Dashboard] Error fetching stored credentials:', error);
+      setIsCredsModalVisible(true);
+    }
+  };
+
+  /**
+   * Saves updated portal credentials into Android Keystore / EncryptedSharedPreferences.
+   */
+  const handleSaveCredentials = async () => {
+    if (!portalUserId.trim() || !portalPassword.trim()) {
+      Alert.alert('Validation Error', 'Both User ID and Password are required.');
+      return;
+    }
+
+    try {
+      setIsSavingCreds(true);
+      await savePortalCredentials(portalUserId, portalPassword);
+      setIsSavingCreds(false);
+      setIsCredsModalVisible(false);
+      Alert.alert('Saved', 'Form-C portal credentials securely saved on device.');
+    } catch (error: any) {
+      setIsSavingCreds(false);
+      Alert.alert('Save Error', error.message || 'Failed to save credentials.');
+    }
+  };
+
+  /**
+   * Clears saved portal credentials from secure storage.
+   */
+  const handleClearCredentials = async () => {
+    try {
+      await clearPortalCredentials();
+      setPortalUserId('');
+      setPortalPassword('');
+      Alert.alert('Cleared', 'Portal credentials removed from secure storage.');
+    } catch (error: any) {
+      Alert.alert('Clear Error', error.message || 'Failed to clear credentials.');
+    }
+  };
+
+  /**
    * Allows manual single-card retry when a submission is stuck in UPLOAD_PENDING.
    *
    * @param item - The target submission record to retry
@@ -83,7 +153,7 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
       const db = await openDatabase();
       const safeSubmissionId = String(item.id).trim();
 
-      // 1. Fetch document record associated with this submission
+      // Fetch document record associated with this submission
       const docs = await db.getAllAsync<GuestDocumentRecord>(
         'SELECT * FROM guest_documents WHERE submission_id = ? LIMIT 1;',
         [safeSubmissionId]
@@ -95,9 +165,8 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
       }
 
       const guestDoc = docs[0];
-      console.log(`[Dashboard] Found document: ${guestDoc.passport_bio_path}`);
 
-      // 2. Post multipart upload to backend API (guest_photo remains local on-device)
+      // Post multipart upload to backend API (guest portrait stays local on device)
       const response = await submitGuestDocuments(
         guestDoc.passport_bio_path,
         guestDoc.visa_stamp_path ?? undefined,
@@ -108,7 +177,7 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
 
       console.log(`[Dashboard] Upload succeeded with job_id: ${response.job_id}`);
 
-      // 3. On success, advance status to PROCESSING with returned job_id
+      // Advance status to PROCESSING with returned job_id
       await updateSubmissionStatus(safeSubmissionId, 'PROCESSING', response.job_id);
       await loadSubmissions();
 
@@ -127,7 +196,7 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
     }
   };
 
-  // Initial mount load
+  // Initial load on mount
   useEffect(() => {
     loadSubmissions();
   }, [loadSubmissions]);
@@ -255,14 +324,32 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
   return (
     <View style={[styles.container, { backgroundColor: colors.background }]}>
       {/* Top Navigation & App Bar */}
-      <View style={[styles.topBar, { backgroundColor: colors.surface, borderBottomColor: colors.border }]}>
-        <Text style={[styles.appTitle, { color: colors.primaryBrand }]}>Homestay Document Capture</Text>
-        <TouchableOpacity
-          onPress={toggleTheme}
-          style={[styles.themeToggleButton, { backgroundColor: colors.surfaceSubtle }]}
-        >
-          <Text style={styles.themeToggleIcon}>{isDark ? '☀️' : '🌙'}</Text>
-        </TouchableOpacity>
+      <View
+        style={[
+          styles.topBar,
+          { backgroundColor: colors.surface, borderBottomColor: colors.border },
+        ]}
+      >
+        <Text style={[styles.appTitle, { color: colors.primaryBrand }]}>
+          Homestay Document Capture
+        </Text>
+        <View style={styles.topBarActions}>
+          {/* Key Button to open Portal Credentials Modal */}
+          <TouchableOpacity
+            onPress={handleOpenCredentialsModal}
+            style={[styles.iconButton, { backgroundColor: colors.surfaceSubtle }]}
+          >
+            <Text style={styles.iconButtonText}>🔑</Text>
+          </TouchableOpacity>
+
+          {/* Theme Toggle Button */}
+          <TouchableOpacity
+            onPress={toggleTheme}
+            style={[styles.iconButton, { backgroundColor: colors.surfaceSubtle, marginLeft: 8 }]}
+          >
+            <Text style={styles.iconButtonText}>{isDark ? '☀️' : '🌙'}</Text>
+          </TouchableOpacity>
+        </View>
       </View>
 
       {/* Main Queue List */}
@@ -296,7 +383,12 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
       )}
 
       {/* Floating Bottom Sticky Action Bar */}
-      <View style={[styles.bottomBarContainer, { backgroundColor: colors.surface, borderTopColor: colors.border }]}>
+      <View
+        style={[
+          styles.bottomBarContainer,
+          { backgroundColor: colors.surface, borderTopColor: colors.border },
+        ]}
+      >
         <TouchableOpacity
           onPress={onStartNewCapture}
           style={[styles.primaryActionButton, { backgroundColor: colors.primaryBrand }]}
@@ -304,6 +396,103 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
           <Text style={styles.primaryActionText}>+ New Guest Capture</Text>
         </TouchableOpacity>
       </View>
+
+      {/* Modal: Form-C Portal Credentials */}
+      <Modal
+        visible={isCredsModalVisible}
+        transparent={true}
+        animationType="fade"
+        onRequestClose={() => setIsCredsModalVisible(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <View
+            style={[
+              styles.modalDialog,
+              { backgroundColor: colors.surface, borderColor: colors.border },
+            ]}
+          >
+            <Text style={[styles.modalTitle, { color: colors.textPrimary }]}>
+              Form-C Portal Credentials
+            </Text>
+            <Text style={[styles.modalSubtitle, { color: colors.textMuted }]}>
+              Stored encrypted on device using Android Keystore.
+            </Text>
+
+            {/* User ID Field */}
+            <View style={styles.modalFieldGroup}>
+              <Text style={[styles.modalLabel, { color: colors.textPrimary }]}>Portal User ID</Text>
+              <TextInput
+                style={[
+                  styles.modalInput,
+                  {
+                    backgroundColor: colors.surfaceSubtle,
+                    color: colors.textPrimary,
+                    borderColor: colors.border,
+                  },
+                ]}
+                placeholder="e.g. KER_KOC_00123"
+                placeholderTextColor={colors.textMuted}
+                autoCapitalize="none"
+                value={portalUserId}
+                onChangeText={setPortalUserId}
+              />
+            </View>
+
+            {/* Password Field */}
+            <View style={styles.modalFieldGroup}>
+              <Text style={[styles.modalLabel, { color: colors.textPrimary }]}>Portal Password</Text>
+              <TextInput
+                style={[
+                  styles.modalInput,
+                  {
+                    backgroundColor: colors.surfaceSubtle,
+                    color: colors.textPrimary,
+                    borderColor: colors.border,
+                  },
+                ]}
+                placeholder="Enter password"
+                placeholderTextColor={colors.textMuted}
+                secureTextEntry={true}
+                autoCapitalize="none"
+                value={portalPassword}
+                onChangeText={setPortalPassword}
+              />
+            </View>
+
+            {/* Save / Clear / Cancel Actions */}
+            <View style={styles.modalActionsRow}>
+              <TouchableOpacity
+                onPress={handleClearCredentials}
+                style={[styles.modalActionButton, { backgroundColor: colors.statusPending }]}
+              >
+                <Text style={styles.modalActionText}>Clear</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                onPress={() => setIsCredsModalVisible(false)}
+                style={[
+                  styles.modalActionButton,
+                  { backgroundColor: colors.surfaceSubtle, borderColor: colors.border, borderWidth: 1 },
+                ]}
+              >
+                <Text style={[styles.modalActionText, { color: colors.textPrimary }]}>Cancel</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                disabled={isSavingCreds}
+                onPress={handleSaveCredentials}
+                style={[styles.modalActionButton, { backgroundColor: colors.primaryBrand }]}
+              >
+                {isSavingCreds ? (
+                  <ActivityIndicator color="#FFFFFF" size="small" />
+                ) : (
+                  <Text style={styles.modalActionText}>Save</Text>
+                )}
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
     </View>
   );
 };
@@ -326,17 +515,21 @@ const styles = StyleSheet.create({
     borderBottomWidth: 1,
   },
   appTitle: {
-    fontSize: 18,
+    fontSize: 17,
     fontWeight: '700',
   },
-  themeToggleButton: {
+  topBarActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  iconButton: {
     width: 36,
     height: 36,
     borderRadius: 18,
     alignItems: 'center',
     justifyContent: 'center',
   },
-  themeToggleIcon: {
+  iconButtonText: {
     fontSize: 18,
   },
   listContent: {
@@ -427,5 +620,59 @@ const styles = StyleSheet.create({
     color: '#FFFFFF',
     fontSize: 16,
     fontWeight: '700',
+  },
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 0, 0, 0.55)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 20,
+  },
+  modalDialog: {
+    width: '100%',
+    borderRadius: 14,
+    borderWidth: 1,
+    padding: 20,
+  },
+  modalTitle: {
+    fontSize: 18,
+    fontWeight: '700',
+    marginBottom: 4,
+  },
+  modalSubtitle: {
+    fontSize: 13,
+    marginBottom: 16,
+  },
+  modalFieldGroup: {
+    marginBottom: 12,
+  },
+  modalLabel: {
+    fontSize: 13,
+    fontWeight: '600',
+    marginBottom: 6,
+  },
+  modalInput: {
+    height: 44,
+    borderRadius: 8,
+    borderWidth: 1,
+    paddingHorizontal: 12,
+    fontSize: 14,
+  },
+  modalActionsRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginTop: 16,
+  },
+  modalActionButton: {
+    flex: 0.31,
+    height: 44,
+    borderRadius: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  modalActionText: {
+    color: '#FFFFFF',
+    fontSize: 14,
+    fontWeight: '600',
   },
 });
