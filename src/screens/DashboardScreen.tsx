@@ -1,0 +1,334 @@
+import React, { useState, useEffect, useCallback } from 'react';
+import {
+  View,
+  Text,
+  StyleSheet,
+  TouchableOpacity,
+  FlatList,
+  RefreshControl,
+  ActivityIndicator,
+} from 'react-native';
+import { useAppTheme } from '../theme/ThemeContext';
+import { getAllSubmissions, SubmissionRecord, SubmissionStatus } from '../db/database';
+import { runFullSync } from '../services/syncManager';
+
+interface DashboardScreenProps {
+  onStartNewCapture: () => void;
+  onOpenReview: (submissionId: string) => void;
+}
+
+export const DashboardScreen: React.FC<DashboardScreenProps> = ({
+  onStartNewCapture,
+  onOpenReview,
+}) => {
+  const { colors, isDark, toggleTheme } = useAppTheme();
+
+  // Screen state
+  const [submissions, setSubmissions] = useState<SubmissionRecord[]>([]);
+  const [loading, setLoading] = useState<boolean>(true);
+  const [refreshing, setRefreshing] = useState<boolean>(false);
+
+  /**
+   * Queries local SQLite database to load recent guest submissions.
+   */
+  const loadSubmissions = useCallback(async () => {
+    try {
+      const records = await getAllSubmissions();
+      setSubmissions(records);
+    } catch (error) {
+      console.warn('[Dashboard] Error querying submissions from SQLite:', error);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  /**
+   * Pull-to-refresh handler: runs sync runner against backend API,
+   * then reloads local database rows.
+   */
+  const handleRefresh = async () => {
+    setRefreshing(true);
+    try {
+      // 1. Fire background upload and polling jobs
+      await runFullSync();
+      // 2. Refresh local records
+      await loadSubmissions();
+    } catch (error) {
+      console.warn('[Dashboard] Sync runner failed:', error);
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
+  // Load submissions on mount
+  useEffect(() => {
+    loadSubmissions();
+  }, [loadSubmissions]);
+
+  /**
+   * Helper returning semantic status pill colors based on current state.
+   */
+  const getStatusBadgeStyle = (status: SubmissionStatus) => {
+    switch (status) {
+      case 'UPLOAD_PENDING':
+        return { backgroundColor: colors.statusPending, label: 'Upload Pending' };
+      case 'PROCESSING':
+        return { backgroundColor: colors.statusProcess, label: 'Processing' };
+      case 'PENDING_REVIEW':
+        return { backgroundColor: colors.statusReady, label: 'Ready for Review' };
+      case 'REVIEWED':
+        return { backgroundColor: colors.statusDone, label: 'Reviewed' };
+      default:
+        return { backgroundColor: colors.textMuted, label: status };
+    }
+  };
+
+  /**
+   * Formats ISO timestamp into human-readable date.
+   */
+  const formatDate = (isoString: string): string => {
+    try {
+      const date = new Date(isoString);
+      return date.toLocaleDateString(undefined, {
+        month: 'short',
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+      });
+    } catch {
+      return isoString;
+    }
+  };
+
+  /**
+   * Renders an individual submission item styled like an Amazon order/Alexa routine card.
+   */
+  const renderSubmissionItem = ({ item }: { item: SubmissionRecord }) => {
+    const badge = getStatusBadgeStyle(item.status);
+    const isReadyForReview = item.status === 'PENDING_REVIEW';
+
+    return (
+      <TouchableOpacity
+        activeOpacity={0.7}
+        onPress={() => {
+          if (isReadyForReview) {
+            onOpenReview(item.id);
+          }
+        }}
+        style={[
+          styles.submissionCard,
+          {
+            backgroundColor: colors.surface,
+            borderColor: colors.border,
+          },
+        ]}
+      >
+        <View style={styles.cardHeaderRow}>
+          <Text style={[styles.referenceText, { color: colors.textPrimary }]} numberOfLines={1}>
+            {item.reference || 'Homestay Guest Capture'}
+          </Text>
+          <View style={[styles.statusBadge, { backgroundColor: badge.backgroundColor }]}>
+            <Text style={styles.statusBadgeText}>{badge.label}</Text>
+          </View>
+        </View>
+
+        <View style={styles.cardMetaRow}>
+          <Text style={[styles.metaLabel, { color: colors.textMuted }]}>
+            ID: <Text style={{ color: colors.textPrimary }}>{item.id.slice(0, 14)}...</Text>
+          </Text>
+          <Text style={[styles.metaLabel, { color: colors.textMuted }]}>
+            {item.guest_count} Guest{item.guest_count > 1 ? 's' : ''}
+          </Text>
+        </View>
+
+        <View style={styles.cardFooterRow}>
+          <Text style={[styles.dateText, { color: colors.textMuted }]}>
+            {formatDate(item.created_at)}
+          </Text>
+          {isReadyForReview && (
+            <Text style={[styles.reviewActionText, { color: colors.statusReady }]}>
+              Tap to Verify →
+            </Text>
+          )}
+        </View>
+      </TouchableOpacity>
+    );
+  };
+
+  return (
+    <View style={[styles.container, { backgroundColor: colors.background }]}>
+      {/* Top Navigation & App Bar */}
+      <View style={[styles.topBar, { backgroundColor: colors.surface, borderBottomColor: colors.border }]}>
+        <Text style={[styles.appTitle, { color: colors.primaryBrand }]}>Homestay Document Capture</Text>
+        <TouchableOpacity
+          onPress={toggleTheme}
+          style={[styles.themeToggleButton, { backgroundColor: colors.surfaceSubtle }]}
+        >
+          <Text style={styles.themeToggleIcon}>{isDark ? '☀️' : '🌙'}</Text>
+        </TouchableOpacity>
+      </View>
+
+      {/* Main Queue List */}
+      {loading ? (
+        <View style={styles.centerContainer}>
+          <ActivityIndicator size="large" color={colors.primaryBrand} />
+        </View>
+      ) : (
+        <FlatList
+          data={submissions}
+          keyExtractor={(item) => item.id}
+          renderItem={renderSubmissionItem}
+          contentContainerStyle={styles.listContent}
+          refreshControl={
+            <RefreshControl
+              refreshing={refreshing}
+              onRefresh={handleRefresh}
+              colors={[colors.primaryBrand]}
+              tintColor={colors.primaryBrand}
+            />
+          }
+          ListEmptyComponent={
+            <View style={styles.emptyContainer}>
+              <Text style={[styles.emptyTitle, { color: colors.textPrimary }]}>No captures yet</Text>
+              <Text style={[styles.emptySubtitle, { color: colors.textMuted }]}>
+                Tap the button below to capture the 4 guest documents.
+              </Text>
+            </View>
+          }
+        />
+      )}
+
+      {/* Floating Bottom Sticky Action Bar (Amazon / Alexa Style) */}
+      <View style={[styles.bottomBarContainer, { backgroundColor: colors.surface, borderTopColor: colors.border }]}>
+        <TouchableOpacity
+          onPress={onStartNewCapture}
+          style={[styles.primaryActionButton, { backgroundColor: colors.primaryBrand }]}
+        >
+          <Text style={styles.primaryActionText}>+ New Guest Capture</Text>
+        </TouchableOpacity>
+      </View>
+    </View>
+  );
+};
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+  },
+  centerContainer: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  topBar: {
+    height: 60,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 16,
+    borderBottomWidth: 1,
+  },
+  appTitle: {
+    fontSize: 18,
+    fontWeight: '700',
+  },
+  themeToggleButton: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  themeToggleIcon: {
+    fontSize: 18,
+  },
+  listContent: {
+    padding: 16,
+    paddingBottom: 90,
+  },
+  submissionCard: {
+    borderRadius: 12,
+    borderWidth: 1,
+    padding: 16,
+    marginBottom: 12,
+  },
+  cardHeaderRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 8,
+  },
+  referenceText: {
+    fontSize: 16,
+    fontWeight: '600',
+    flex: 1,
+    marginRight: 8,
+  },
+  statusBadge: {
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 6,
+  },
+  statusBadgeText: {
+    color: '#FFFFFF',
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  cardMetaRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginBottom: 8,
+  },
+  metaLabel: {
+    fontSize: 13,
+  },
+  cardFooterRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: '#E2E8F0',
+    paddingTop: 8,
+  },
+  dateText: {
+    fontSize: 12,
+  },
+  reviewActionText: {
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  emptyContainer: {
+    paddingTop: 60,
+    alignItems: 'center',
+    paddingHorizontal: 32,
+  },
+  emptyTitle: {
+    fontSize: 18,
+    fontWeight: '600',
+    marginBottom: 8,
+  },
+  emptySubtitle: {
+    fontSize: 14,
+    textAlign: 'center',
+    lineHeight: 20,
+  },
+  bottomBarContainer: {
+    position: 'absolute',
+    bottom: 0,
+    left: 0,
+    right: 0,
+    padding: 16,
+    borderTopWidth: 1,
+  },
+  primaryActionButton: {
+    height: 50,
+    borderRadius: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  primaryActionText: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontWeight: '700',
+  },
+});
