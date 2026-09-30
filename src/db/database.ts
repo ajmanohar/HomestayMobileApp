@@ -27,7 +27,7 @@ export interface SubmissionRecord {
 }
 
 /**
- * Represents the 4 captured document image URIs and OCR output for an individual guest.
+ * Represents the captured document image URIs, guest photo, and OCR output for an individual guest.
  */
 export interface GuestDocumentRecord {
   id: string;                  // Primary key
@@ -37,6 +37,7 @@ export interface GuestDocumentRecord {
   visa_stamp_path?: string;    // Local file URI for visa or OCI card
   entry_stamp_path?: string;   // Local file URI for immigration arrival stamp
   form_c_path?: string;        // Local file URI for handwritten Form-C sheet
+  guest_photo_path?: string;   // Local file URI for dedicated guest portrait photo
   extracted_data_json?: string;// Serialized JSON payload returned from OCR backend
 }
 
@@ -55,7 +56,7 @@ export const openDatabase = async (): Promise<SQLite.SQLiteDatabase> => {
 
 /**
  * Initializes required tables safely by executing individual DDL statements.
- * Omits WAL pragma inside execAsync to prevent Expo Go Android NullPointerExceptions.
+ * Adds a safe column migration for guest_photo_path if upgrading existing local databases.
  */
 export const initDatabase = async (): Promise<void> => {
   const db = await openDatabase();
@@ -73,7 +74,7 @@ export const initDatabase = async (): Promise<void> => {
     );
   `);
 
-  // 2. Create child guest_documents table
+  // 2. Create child guest_documents table with guest_photo_path
   await db.execAsync(`
     CREATE TABLE IF NOT EXISTS guest_documents (
       id TEXT PRIMARY KEY NOT NULL,
@@ -83,11 +84,21 @@ export const initDatabase = async (): Promise<void> => {
       visa_stamp_path TEXT,
       entry_stamp_path TEXT,
       form_c_path TEXT,
+      guest_photo_path TEXT,
       extracted_data_json TEXT
     );
   `);
 
-  console.log('[SQLite] Local database initialized successfully.');
+  // 3. Graceful migration check: add guest_photo_path column if table existed from an earlier run
+  try {
+    await db.execAsync(`
+      ALTER TABLE guest_documents ADD COLUMN guest_photo_path TEXT;
+    `);
+  } catch {
+    // Column already exists in current schema; proceed safely
+  }
+
+  console.log('[SQLite] Local database initialized successfully with guest_photo_path column.');
 };
 
 /**
@@ -103,7 +114,7 @@ export const insertSubmission = async (
   const db = await openDatabase();
 
   await db.withTransactionAsync(async () => {
-    // 1. Insert parent submission record (strictly converting all undefined fields to null)
+    // 1. Insert parent submission record (strictly converting undefined to null)
     await db.runAsync(
       `INSERT INTO submissions (id, reference, guest_count, status, job_id, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?);`,
@@ -118,12 +129,12 @@ export const insertSubmission = async (
       ]
     );
 
-    // 2. Insert associated guest document paths
+    // 2. Insert associated guest document paths including guest_photo_path
     for (const doc of documents) {
       await db.runAsync(
         `INSERT INTO guest_documents (
-          id, submission_id, guest_index, passport_bio_path, visa_stamp_path, entry_stamp_path, form_c_path, extracted_data_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?);`,
+          id, submission_id, guest_index, passport_bio_path, visa_stamp_path, entry_stamp_path, form_c_path, guest_photo_path, extracted_data_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);`,
         [
           String(doc.id),
           String(doc.submission_id),
@@ -132,6 +143,7 @@ export const insertSubmission = async (
           doc.visa_stamp_path ? String(doc.visa_stamp_path) : null,
           doc.entry_stamp_path ? String(doc.entry_stamp_path) : null,
           doc.form_c_path ? String(doc.form_c_path) : null,
+          doc.guest_photo_path ? String(doc.guest_photo_path) : null,
           doc.extracted_data_json ? String(doc.extracted_data_json) : null,
         ]
       );
