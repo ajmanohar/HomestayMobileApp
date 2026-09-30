@@ -34,6 +34,9 @@ interface FormCFields {
   purposeOfVisit: string;
 }
 
+// Available tabs for the top document preview viewer
+type DocumentTabKey = 'passport' | 'visa' | 'stamp' | 'form_c' | 'photo';
+
 export const ReviewScreen: React.FC<ReviewScreenProps> = ({
   submissionId,
   onFinishReview,
@@ -44,7 +47,7 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
   // Screen state
   const [loading, setLoading] = useState<boolean>(true);
   const [guestDoc, setGuestDoc] = useState<GuestDocumentRecord | null>(null);
-  const [selectedDocTab, setSelectedDocTab] = useState<'passport' | 'visa' | 'stamp' | 'form_c'>('passport');
+  const [selectedDocTab, setSelectedDocTab] = useState<DocumentTabKey>('passport');
   const [isSaving, setIsSaving] = useState<boolean>(false);
 
   // Editable Form-C verified fields
@@ -145,7 +148,8 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
   };
 
   /**
-   * Determines active document image URI based on selected tab.
+   * Determines active document image URI based on selected tab,
+   * including the dedicated guest portrait photo.
    */
   const getActiveImageUri = (): string | undefined => {
     if (!guestDoc) return undefined;
@@ -158,6 +162,8 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
         return guestDoc.entry_stamp_path;
       case 'form_c':
         return guestDoc.form_c_path;
+      case 'photo':
+        return guestDoc.guest_photo_path;
       default:
         return guestDoc.passport_bio_path;
     }
@@ -190,7 +196,7 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
       <View style={[styles.imageViewerSection, { backgroundColor: colors.surfaceSubtle }]}>
         {/* Document Switcher Tabs */}
         <View style={styles.tabRow}>
-          {(['passport', 'visa', 'stamp', 'form_c'] as const).map((tabKey) => (
+          {(['passport', 'visa', 'stamp', 'form_c', 'photo'] as const).map((tabKey) => (
             <TouchableOpacity
               key={tabKey}
               onPress={() => setSelectedDocTab(tabKey)}
@@ -333,6 +339,18 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
           />
         </View>
 
+        {/* Purpose of Visit */}
+        <View style={styles.fieldGroup}>
+          <Text style={[styles.label, { color: colors.textMuted }]}>Purpose of Visit</Text>
+          <TextInput
+            style={[styles.input, { backgroundColor: colors.surface, color: colors.textPrimary, borderColor: colors.border }]}
+            value={formData.purposeOfVisit}
+            onChangeText={(text) => handleFieldChange('purposeOfVisit', text)}
+            placeholder="e.g. Tourism"
+            placeholderTextColor={colors.textMuted}
+          />
+        </View>
+
         {/* Confirm & Save Button */}
         <TouchableOpacity
           disabled={isSaving}
@@ -398,11 +416,11 @@ const styles = StyleSheet.create({
   tabButton: {
     justifyContent: 'center',
     alignItems: 'center',
-    paddingHorizontal: 8,
+    paddingHorizontal: 6,
     borderBottomWidth: 2,
   },
   tabButtonText: {
-    fontSize: 12,
+    fontSize: 11,
   },
   imageWrapper: {
     flex: 1,
