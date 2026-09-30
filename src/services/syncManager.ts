@@ -14,6 +14,8 @@ export const syncPendingUploads = async (): Promise<void> => {
     `SELECT * FROM submissions WHERE status = 'UPLOAD_PENDING' ORDER BY created_at ASC;`
   );
 
+  console.log(`[SyncManager] Found ${pendingSubmissions.length} pending submissions to upload.`);
+
   for (const submission of pendingSubmissions) {
     try {
       // 2. Fetch associated guest document paths
@@ -23,10 +25,12 @@ export const syncPendingUploads = async (): Promise<void> => {
       );
 
       if (docs.length === 0) {
+        console.warn(`[SyncManager] No documents found for submission ${submission.id}`);
         continue;
       }
 
       const guestDoc = docs[0];
+      console.log(`[SyncManager] Uploading submission ${submission.id}...`);
 
       // 3. Post multipart payload to backend
       const response = await submitGuestDocuments(
@@ -37,10 +41,11 @@ export const syncPendingUploads = async (): Promise<void> => {
         submission.reference
       );
 
+      console.log(`[SyncManager] Upload succeeded. Job ID: ${response.job_id}`);
+
       // 4. Update local record to PROCESSING with assigned job_id
       await updateSubmissionStatus(submission.id, 'PROCESSING', response.job_id);
     } catch (error) {
-      // Keep state as UPLOAD_PENDING so it retries on next sync cycle
       console.warn(`[SyncManager] Failed uploading submission ${submission.id}:`, error);
     }
   }
@@ -58,15 +63,24 @@ export const pollActiveJobs = async (): Promise<void> => {
     `SELECT * FROM submissions WHERE status = 'PROCESSING' AND job_id IS NOT NULL;`
   );
 
+  console.log(`[SyncManager] Polling ${processingSubmissions.length} active processing jobs.`);
+
   for (const submission of processingSubmissions) {
     if (!submission.job_id) continue;
 
     try {
+      console.log(`[SyncManager] Polling job status for ${submission.job_id}...`);
       // 2. Query status from backend
-      const result = await pollJobStatus(submission.job_id);
+      const result: any = await pollJobStatus(submission.job_id);
+      console.log(`[SyncManager] Server response for ${submission.job_id}:`, JSON.stringify(result));
 
-      if (result.status === 'COMPLETED' && result.extracted_data) {
-        const jsonPayload = JSON.stringify(result.extracted_data);
+      // Case-insensitive status check
+      const normalizedStatus = String(result.status || '').toUpperCase();
+
+      if (normalizedStatus === 'COMPLETED') {
+        // Detect payload regardless of whether backend returns 'extracted_data', 'result', 'data', or top-level fields
+        const dataPayload = result.extracted_data || result.result || result.data || result;
+        const jsonPayload = JSON.stringify(dataPayload);
 
         // 3. Persist extracted JSON to guest_documents table
         await db.runAsync(
@@ -75,6 +89,7 @@ export const pollActiveJobs = async (): Promise<void> => {
         );
 
         // 4. Advance submission state to PENDING_REVIEW
+        console.log(`[SyncManager] Marking submission ${submission.id} as PENDING_REVIEW!`);
         await updateSubmissionStatus(submission.id, 'PENDING_REVIEW');
       }
     } catch (error) {
@@ -85,7 +100,6 @@ export const pollActiveJobs = async (): Promise<void> => {
 
 /**
  * Unified sync runner: initiates pending uploads first, then polls active processing jobs.
- * Intended for pull-to-refresh gestures and screen focus triggers.
  */
 export const runFullSync = async (): Promise<void> => {
   await syncPendingUploads();
