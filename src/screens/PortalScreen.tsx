@@ -7,7 +7,7 @@ import {
   ActivityIndicator,
   Alert,
 } from 'react-native';
-import { WebView } from 'react-native-webview';
+import { WebView, WebViewMessageEvent } from 'react-native-webview';
 import { useAppTheme } from '../theme/ThemeContext';
 import { openDatabase, GuestDocumentRecord } from '../db/database';
 import { getPortalCredentials } from '../services/credentialService';
@@ -52,9 +52,29 @@ export const PortalScreen: React.FC<PortalScreenProps> = ({ submissionId, onClos
   }, [submissionId]);
 
   /**
+   * Handles diagnostic messages sent back from the WebView JavaScript context.
+   */
+  const handleWebViewMessage = (event: WebViewMessageEvent) => {
+    try {
+      const data = JSON.parse(event.nativeEvent.data);
+      if (data.type === 'AUTOFILL_LOGIN_RESULT') {
+        if (data.success) {
+          Alert.alert('Autofill Succeeded', data.message);
+        } else {
+          Alert.alert('Autofill Notice', `${data.message}\n\nDetected Inputs on Page:\n${data.foundInputs || 'None'}`);
+        }
+      } else if (data.type === 'AUTOFILL_FORM_RESULT') {
+        Alert.alert(data.success ? 'Form Autofill' : 'Notice', data.message);
+      }
+    } catch {
+      console.log('[PortalScreen] Raw WebView message:', event.nativeEvent.data);
+    }
+  };
+
+  /**
    * Action: Injects stored portal credentials into login DOM inputs.
-   * Matches <input name="u_id"> and <input name="u_pwd">.
-   * Does NOT auto-submit; operator enters CAPTCHA and clicks Sign In manually.
+   * Traverses main document, sub-frames, and iframes.
+   * Uses prototype value setter to bypass portal event trapping.
    */
   const handleAutofillLogin = async () => {
     try {
@@ -68,29 +88,109 @@ export const PortalScreen: React.FC<PortalScreenProps> = ({ submissionId, onClos
         return;
       }
 
-      // JavaScript injection script safely escaping quotes
       const sanitizedUser = JSON.stringify(creds.userId);
       const sanitizedPass = JSON.stringify(creds.password);
 
       const loginInjectionJs = `
         (function() {
           try {
-            var userInput = document.querySelector('input[name="u_id"]') || document.querySelector('#u_id');
-            var passInput = document.querySelector('input[name="u_pwd"]') || document.querySelector('#u_pwd');
+            var targetUserVal = ${sanitizedUser};
+            var targetPassVal = ${sanitizedPass};
 
-            if (userInput) {
-              userInput.value = ${sanitizedUser};
-              userInput.dispatchEvent(new Event('input', { bubbles: true }));
-              userInput.dispatchEvent(new Event('change', { bubbles: true }));
+            // Helper to deeply set an input value and trigger native events
+            function applyInputValue(inputEl, value) {
+              if (!inputEl) return;
+              inputEl.focus();
+              var nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
+              if (nativeSetter && nativeSetter.set) {
+                nativeSetter.set.call(inputEl, value);
+              } else {
+                inputEl.value = value;
+              }
+              inputEl.dispatchEvent(new Event('input', { bubbles: true }));
+              inputEl.dispatchEvent(new Event('change', { bubbles: true }));
+              inputEl.dispatchEvent(new Event('blur', { bubbles: true }));
             }
 
-            if (passInput) {
-              passInput.value = ${sanitizedPass};
-              passInput.dispatchEvent(new Event('input', { bubbles: true }));
-              passInput.dispatchEvent(new Event('change', { bubbles: true }));
+            // Search both main document and any accessible iframes / frames
+            var searchContexts = [document];
+            var iframes = document.querySelectorAll('iframe, frame');
+            for (var i = 0; i < iframes.length; i++) {
+              try {
+                if (iframes[i].contentDocument) {
+                  searchContexts.push(iframes[i].contentDocument);
+                }
+              } catch(e) {}
             }
-          } catch (e) {
-            console.error('Portal login injection error:', e);
+
+            var userInput = null;
+            var passInput = null;
+            var recordedInputs = [];
+
+            for (var c = 0; c < searchContexts.length; c++) {
+              var ctx = searchContexts[c];
+
+              // 1. Direct attribute selectors (matching Form-C source specifications)
+              if (!userInput) {
+                userInput = ctx.querySelector('input[name="u_id"]') ||
+                            ctx.querySelector('#u_id') ||
+                            ctx.querySelector('input[name*="user" i]') ||
+                            ctx.querySelector('input[name*="uid" i]') ||
+                            ctx.querySelector('input[name*="login" i]');
+              }
+
+              if (!passInput) {
+                passInput = ctx.querySelector('input[name="u_pwd"]') ||
+                            ctx.querySelector('#u_pwd') ||
+                            ctx.querySelector('input[type="password"]');
+              }
+
+              // Collect diagnostic list of inputs for debugging
+              var allInputs = ctx.querySelectorAll('input');
+              for (var k = 0; k < allInputs.length; k++) {
+                var inp = allInputs[k];
+                recordedInputs.push(inp.name ? ('name=' + inp.name) : (inp.id ? ('id=' + inp.id) : ('type=' + inp.type)));
+              }
+
+              // 2. Generic heuristic fallback: if password field found, take the text field preceding it
+              if (passInput && !userInput) {
+                var allCtxInputs = Array.from(ctx.querySelectorAll('input'));
+                var passIdx = allCtxInputs.indexOf(passInput);
+                for (var j = passIdx - 1; j >= 0; j--) {
+                  var candidate = allCtxInputs[j];
+                  if (candidate.type === 'text' || candidate.type === '') {
+                    userInput = candidate;
+                    break;
+                  }
+                }
+              }
+
+              if (userInput && passInput) break;
+            }
+
+            if (userInput && passInput) {
+              applyInputValue(userInput, targetUserVal);
+              applyInputValue(passInput, targetPassVal);
+
+              window.ReactNativeWebView.postMessage(JSON.stringify({
+                type: 'AUTOFILL_LOGIN_RESULT',
+                success: true,
+                message: 'Credentials filled successfully! Please enter CAPTCHA and sign in.'
+              }));
+            } else {
+              window.ReactNativeWebView.postMessage(JSON.stringify({
+                type: 'AUTOFILL_LOGIN_RESULT',
+                success: false,
+                message: 'Could not find Username or Password input elements.',
+                foundInputs: recordedInputs.join(', ')
+              }));
+            }
+          } catch (err) {
+            window.ReactNativeWebView.postMessage(JSON.stringify({
+              type: 'AUTOFILL_LOGIN_RESULT',
+              success: false,
+              message: 'Script error: ' + err.message
+            }));
           }
         })();
         true;
@@ -104,7 +204,6 @@ export const PortalScreen: React.FC<PortalScreenProps> = ({ submissionId, onClos
 
   /**
    * Action: Injects verified guest values into the Form-C arrival registration form.
-   * Queries standard Form-C field selectors, handles dropdown matching, and dispatches events.
    */
   const handleAutofillGuestData = () => {
     if (!guestData) {
@@ -112,7 +211,6 @@ export const PortalScreen: React.FC<PortalScreenProps> = ({ submissionId, onClos
       return;
     }
 
-    // Prepare stringified payload for safe injection
     const payloadJson = JSON.stringify(guestData);
 
     const formCAutoFillJs = `
@@ -121,22 +219,27 @@ export const PortalScreen: React.FC<PortalScreenProps> = ({ submissionId, onClos
           var data = ${payloadJson};
           var fieldsUpdated = 0;
 
-          // Helper to set value and dispatch synthetic events
           function setField(selectors, val) {
             if (!val) return;
             for (var i = 0; i < selectors.length; i++) {
               var el = document.querySelector(selectors[i]);
               if (el) {
-                el.value = val;
+                el.focus();
+                var nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
+                if (nativeSetter && nativeSetter.set) {
+                  nativeSetter.set.call(el, val);
+                } else {
+                  el.value = val;
+                }
                 el.dispatchEvent(new Event('input', { bubbles: true }));
                 el.dispatchEvent(new Event('change', { bubbles: true }));
+                el.dispatchEvent(new Event('blur', { bubbles: true }));
                 fieldsUpdated++;
                 break;
               }
             }
           }
 
-          // Helper for dropdown select elements
           function setSelect(selectors, targetText) {
             if (!targetText) return;
             for (var i = 0; i < selectors.length; i++) {
@@ -174,12 +277,17 @@ export const PortalScreen: React.FC<PortalScreenProps> = ({ submissionId, onClos
           setField(['input[name="proc_to"]', '#proc_to', 'input[name="proceeding_to"]'], data.proceedingTo);
           setField(['input[name="purpose_of_visit"]', '#purpose_of_visit', 'input[name="purpose"]'], data.purposeOfVisit || 'Tourism');
 
-          // Return count back to React Native via console or alert
-          console.log('[FormC Autofill] Updated ' + fieldsUpdated + ' fields successfully.');
-          alert('Auto-filled ' + fieldsUpdated + ' guest fields! Please review before submission.');
+          window.ReactNativeWebView.postMessage(JSON.stringify({
+            type: 'AUTOFILL_FORM_RESULT',
+            success: true,
+            message: 'Auto-filled ' + fieldsUpdated + ' guest fields! Please review before submission.'
+          }));
         } catch (err) {
-          console.error('[FormC Autofill] Error injecting fields:', err);
-          alert('Error during field population: ' + err.message);
+          window.ReactNativeWebView.postMessage(JSON.stringify({
+            type: 'AUTOFILL_FORM_RESULT',
+            success: false,
+            message: 'Error during field population: ' + err.message
+          }));
         }
       })();
       true;
@@ -223,6 +331,7 @@ export const PortalScreen: React.FC<PortalScreenProps> = ({ submissionId, onClos
           domStorageEnabled={true}
           sharedCookiesEnabled={true}
           thirdPartyCookiesEnabled={true}
+          onMessage={handleWebViewMessage}
           onLoadStart={() => setLoadingWeb(true)}
           onLoadEnd={() => setLoadingWeb(false)}
           onNavigationStateChange={(navState) => {
