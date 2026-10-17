@@ -388,7 +388,7 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
                 🛂 Passport / Identity Details
               </Text>
               {renderField('Surname (As in Passport)', 'surname', 'e.g. DOE')}
-              {renderField('Given Name(s)', 'givenName', 'e.g. JOHN BAUER')}
+              {renderField('Given Name(s)', 'givenName', 'e.g. JOHN')}
               {renderField('Sex (M / F / O)', 'sex', 'M')}
               {renderField('Date of Birth (YYYY-MM-DD)', 'dateOfBirth', 'YYYY-MM-DD')}
               {renderField('Nationality', 'nationality', 'e.g. American')}
@@ -450,7 +450,7 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
                 👤 Guest Portrait Photo
               </Text>
               <Text style={[styles.helperText, { color: colors.textMuted }]}>
-                Passport portrait photo cropped for portal upload. You can edit guest names below:
+                Passport portrait photo cropped for portal upload. You can review or edit guest names below:
               </Text>
               {renderField('Given Name(s)', 'givenName', 'e.g. JOHN')}
               {renderField('Surname', 'surname', 'e.g. DOE')}
