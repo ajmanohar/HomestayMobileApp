@@ -77,9 +77,35 @@ export const attachDocumentToJob = async (
 };
 
 /**
+ * Triggers backend queue processing after all files have finished uploading.
+ *
+ * @param jobId - UUID of the job to begin processing
+ */
+export const startJobProcessing = async (jobId: string): Promise<void> => {
+  const startUrl = `${BASE_URL}/jobs/${jobId}/start`;
+
+  console.log(`[ApiService] Triggering background extraction worker for job ${jobId}...`);
+
+  const response = await fetch(startUrl, {
+    method: 'POST',
+    headers: {
+      Accept: 'application/json',
+    },
+  });
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    console.warn(`[ApiService] Start worker request returned status ${response.status}: ${errorBody}`);
+  } else {
+    console.log(`[ApiService] Extraction worker successfully triggered for job ${jobId}.`);
+  }
+};
+
+/**
  * Submits all captured documents into the backend extraction pipeline.
- * Submits the mandatory passport bio page first, then sequentially attaches
- * the visa page, entry stamp, and handwritten Form-C arrival report.
+ * Submits the mandatory passport bio page first, sequentially attaches
+ * the visa page, entry stamp, and handwritten Form-C arrival report,
+ * and finally sends the start trigger to process all documents together.
  *
  * @param passportBioPath - Local file URI for passport bio page (mandatory)
  * @param visaPath - Local file URI for visa or OCI card (optional)
@@ -149,6 +175,13 @@ export const submitGuestDocuments = async (
     } catch (err) {
       console.warn('[ApiService] Error attaching welcome form:', err);
     }
+  }
+
+  // 5. Explicitly signal the backend that all attachments are present and processing may begin
+  try {
+    await startJobProcessing(jobId);
+  } catch (err) {
+    console.warn('[ApiService] Error dispatching start trigger:', err);
   }
 
   return parsedSubmit;
