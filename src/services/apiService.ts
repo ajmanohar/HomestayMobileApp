@@ -25,18 +25,26 @@ export interface JobStatusResponse {
 }
 
 /**
- * Helper to construct an uploadable file object for React Native FormData.
+ * Helper to construct an uploadable file object strictly compatible
+ * with React Native Android's native OkHttp multipart engine.
  *
  * @param uri - Local file URI (e.g., file:///data/user/0/.../passport.jpg)
- * @param defaultName - Fallback file name if URI does not contain one
- * @param type - MIME type string
+ * @param defaultName - Fallback filename
+ * @param mimeType - Explicit MIME type (defaults to 'image/jpeg')
  */
-const createFormDataFile = (uri: string, defaultName: string, type: string = 'image/jpeg') => {
-  const filename = uri.split('/').pop() || defaultName;
+const createFormDataFile = (
+  uri: string,
+  defaultName: string,
+  mimeType: string = 'image/jpeg'
+) => {
+  // Ensure uri string is clean and properly prefixed
+  const cleanUri = uri.startsWith('file://') ? uri : `file://${uri}`;
+  const filename = cleanUri.split('/').pop() || defaultName;
+
   return {
-    uri,
+    uri: cleanUri,
     name: filename,
-    type,
+    type: mimeType,
   } as any;
 };
 
@@ -60,11 +68,11 @@ export const submitGuestDocuments = async (
 ): Promise<JobSubmitResponse> => {
   const uploadUrl = `${BASE_URL}/jobs/submit`;
 
-  // Initialize multipart/form-data container
+  // Initialize native multipart/form-data container
   const formData = new FormData();
 
   // 1. Mandatory: Passport Bio-Data page
-  if (passportBioPath) {
+  if (passportBioPath && typeof passportBioPath === 'string') {
     formData.append(
       'passport_bio',
       createFormDataFile(passportBioPath, 'passport_bio.jpg', 'image/jpeg')
@@ -74,7 +82,7 @@ export const submitGuestDocuments = async (
   }
 
   // 2. Optional: Visa / OCI page
-  if (visaPath) {
+  if (visaPath && typeof visaPath === 'string' && visaPath.trim().length > 0) {
     formData.append(
       'visa',
       createFormDataFile(visaPath, 'visa.jpg', 'image/jpeg')
@@ -82,7 +90,7 @@ export const submitGuestDocuments = async (
   }
 
   // 3. Optional: Entry Immigration Stamp page
-  if (entryStampPath) {
+  if (entryStampPath && typeof entryStampPath === 'string' && entryStampPath.trim().length > 0) {
     formData.append(
       'entry_stamp',
       createFormDataFile(entryStampPath, 'entry_stamp.jpg', 'image/jpeg')
@@ -90,7 +98,7 @@ export const submitGuestDocuments = async (
   }
 
   // 4. Optional: Handwritten Form-C arrival slip
-  if (formCPath) {
+  if (formCPath && typeof formCPath === 'string' && formCPath.trim().length > 0) {
     formData.append(
       'form_c',
       createFormDataFile(formCPath, 'form_c.jpg', 'image/jpeg')
@@ -98,18 +106,18 @@ export const submitGuestDocuments = async (
   }
 
   // 5. Booking reference metadata
-  if (reference && reference.trim().length > 0) {
+  if (reference && typeof reference === 'string' && reference.trim().length > 0) {
     formData.append('reference', reference.trim());
   }
 
-  // Post the multipart payload to the backend FastAPI endpoint
+  // Post the multipart payload to backend FastAPI endpoint
   const response = await fetch(uploadUrl, {
     method: 'POST',
     body: formData,
     headers: {
       Accept: 'application/json',
-      // Note: Do NOT set 'Content-Type': 'multipart/form-data' manually here;
-      // React Native fetch will automatically append the correct multipart boundary.
+      // Note: Do NOT set 'Content-Type': 'multipart/form-data';
+      // React Native fetch will automatically compute the multipart boundary header.
     },
   });
 
