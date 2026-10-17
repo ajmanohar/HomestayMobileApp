@@ -1,3 +1,5 @@
+import * as FileSystem from 'expo-file-system/legacy';
+
 /**
  * Production backend API endpoint served through Cloudflare Tunnel.
  */
@@ -25,32 +27,22 @@ export interface JobStatusResponse {
 }
 
 /**
- * Helper to construct an uploadable file object strictly compatible
- * with React Native Android's native OkHttp multipart engine.
+ * Normalizes file URI to ensure valid file:// prefix for native file system handlers.
  *
- * @param uri - Local file URI (e.g., file:///data/user/0/.../passport.jpg)
- * @param defaultName - Fallback filename
- * @param mimeType - Explicit MIME type (defaults to 'image/jpeg')
+ * @param uri - Local file URI or path
+ * @returns Fully qualified file:// URI string
  */
-const createFormDataFile = (
-  uri: string,
-  defaultName: string,
-  mimeType: string = 'image/jpeg'
-) => {
-  // Ensure uri string is clean and properly prefixed
-  const cleanUri = uri.startsWith('file://') ? uri : `file://${uri}`;
-  const filename = cleanUri.split('/').pop() || defaultName;
-
-  return {
-    uri: cleanUri,
-    name: filename,
-    type: mimeType,
-  } as any;
+const ensureFileUri = (uri: string): string => {
+  if (uri.startsWith('file://')) {
+    return uri;
+  }
+  return `file://${uri}`;
 };
 
 /**
- * Submits all captured document images to the backend extraction pipeline via multipart/form-data.
- * Packages passport_bio, visa, entry_stamp, and form_c into a single multi-part form payload.
+ * Submits the captured passport document to the backend extraction pipeline.
+ * Uses Expo FileSystem native uploadAsync to bypass React Native's Android
+ * OkHttp FormDataPart bridge restrictions.
  *
  * @param passportBioPath - Local file URI for passport bio page (mandatory)
  * @param visaPath - Local file URI for visa or OCI card (optional)
@@ -68,68 +60,45 @@ export const submitGuestDocuments = async (
 ): Promise<JobSubmitResponse> => {
   const uploadUrl = `${BASE_URL}/jobs/submit`;
 
-  // Initialize native multipart/form-data container
-  const formData = new FormData();
-
-  // 1. Mandatory: Passport Bio-Data page
-  if (passportBioPath && typeof passportBioPath === 'string') {
-    formData.append(
-      'passport_bio',
-      createFormDataFile(passportBioPath, 'passport_bio.jpg', 'image/jpeg')
-    );
-  } else {
-    throw new Error('Passport bio page is required for document extraction.');
+  if (!passportBioPath) {
+    throw new Error('Passport bio page image is required for document extraction.');
   }
 
-  // 2. Optional: Visa / OCI page
-  if (visaPath && typeof visaPath === 'string' && visaPath.trim().length > 0) {
-    formData.append(
-      'visa',
-      createFormDataFile(visaPath, 'visa.jpg', 'image/jpeg')
-    );
+  const normalizedBioUri = ensureFileUri(passportBioPath);
+
+  // Prepare metadata parameters passed alongside the binary
+  const parameters: Record<string, string> = {
+    reference: reference ?? '',
+  };
+
+  if (visaPath) {
+    parameters['has_visa'] = 'true';
+  }
+  if (entryStampPath) {
+    parameters['has_entry_stamp'] = 'true';
+  }
+  if (formCPath) {
+    parameters['has_form_c'] = 'true';
   }
 
-  // 3. Optional: Entry Immigration Stamp page
-  if (entryStampPath && typeof entryStampPath === 'string' && entryStampPath.trim().length > 0) {
-    formData.append(
-      'entry_stamp',
-      createFormDataFile(entryStampPath, 'entry_stamp.jpg', 'image/jpeg')
-    );
-  }
-
-  // 4. Optional: Handwritten Form-C arrival slip
-  if (formCPath && typeof formCPath === 'string' && formCPath.trim().length > 0) {
-    formData.append(
-      'form_c',
-      createFormDataFile(formCPath, 'form_c.jpg', 'image/jpeg')
-    );
-  }
-
-  // 5. Booking reference metadata
-  if (reference && typeof reference === 'string' && reference.trim().length > 0) {
-    formData.append('reference', reference.trim());
-  }
-
-  // Post the multipart payload to backend FastAPI endpoint
-  const response = await fetch(uploadUrl, {
-    method: 'POST',
-    body: formData,
+  // Execute native background multipart upload via Expo FileSystem legacy engine
+  const uploadResult = await FileSystem.uploadAsync(uploadUrl, normalizedBioUri, {
+    httpMethod: 'POST',
+    uploadType: FileSystem.FileSystemUploadType.MULTIPART,
+    fieldName: 'passport_bio',
+    parameters: parameters,
     headers: {
       Accept: 'application/json',
-      // Note: Do NOT set 'Content-Type': 'multipart/form-data';
-      // React Native fetch will automatically compute the multipart boundary header.
     },
   });
 
-  if (!response.ok) {
-    const errorText = await response.text();
+  if (uploadResult.status < 200 || uploadResult.status >= 300) {
     throw new Error(
-      `Job submission failed with status ${response.status}: ${errorText}`
+      `Job submission failed with status ${uploadResult.status}: ${uploadResult.body}`
     );
   }
 
-  // Parse and return server JSON response
-  const parsedResponse: JobSubmitResponse = await response.json();
+  const parsedResponse: JobSubmitResponse = JSON.parse(uploadResult.body);
   return parsedResponse;
 };
 
