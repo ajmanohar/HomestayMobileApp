@@ -13,16 +13,18 @@
     },
     "android": {
       "adaptiveIcon": {
-        // Point to icon.png instead of missing adaptive-icon.png
         "foregroundImage": "./assets/icon.png",
         "backgroundColor": "#ffffff"
       },
-      // Unique application package identifier
       "package": "com.asymptoteteam.homestaymobileapp",
-      // Network permission for reaching your public API
       "permissions": [
         "android.permission.INTERNET"
       ]
+    },
+    "extra": {
+      "eas": {
+        "projectId": "1fc410ac-80ed-4a51-83af-f0524d4fed23"
+      }
     }
   }
 }
