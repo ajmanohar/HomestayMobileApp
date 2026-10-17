@@ -6,6 +6,7 @@ import {
   TouchableOpacity,
   ActivityIndicator,
   Alert,
+  Linking,
 } from 'react-native';
 import { WebView, WebViewMessageEvent } from 'react-native-webview';
 import { useAppTheme } from '../theme/ThemeContext';
@@ -18,11 +19,15 @@ interface PortalScreenProps {
 }
 
 export const PortalScreen: React.FC<PortalScreenProps> = ({ submissionId, onClose }) => {
+  // Theme styling tokens (supports dark / light mode toggle)
   const { colors } = useAppTheme();
+  
+  // Reference handle to interact with the underlying WebView instance
   const webViewRef = useRef<WebView>(null);
 
   // Screen state
   const [loadingWeb, setLoadingWeb] = useState<boolean>(true);
+  const [sslErrorOccurred, setSslErrorOccurred] = useState<boolean>(false);
   const [currentUrl, setCurrentUrl] = useState<string>(
     'https://indianfrro.gov.in/frro/FormC/login.jsp'
   );
@@ -73,6 +78,23 @@ export const PortalScreen: React.FC<PortalScreenProps> = ({ submissionId, onClos
       }
     } catch {
       console.log('[PortalScreen] Raw WebView message:', event.nativeEvent.data);
+    }
+  };
+
+  /**
+   * Opens the government portal in the phone's native Chrome browser
+   * where the user can accept the Indian NIC CA certificate if blocked in WebView.
+   */
+  const handleOpenInSystemBrowser = async () => {
+    try {
+      const canOpen = await Linking.canOpenURL(currentUrl);
+      if (canOpen) {
+        await Linking.openURL(currentUrl);
+      } else {
+        Alert.alert('Notice', `Unable to open browser for: ${currentUrl}`);
+      }
+    } catch (err: any) {
+      Alert.alert('Browser Error', err.message || 'Failed to open system browser.');
     }
   };
 
@@ -330,7 +352,10 @@ export const PortalScreen: React.FC<PortalScreenProps> = ({ submissionId, onClos
           </Text>
         </View>
         <TouchableOpacity
-          onPress={() => webViewRef.current?.reload()}
+          onPress={() => {
+            setSslErrorOccurred(false);
+            webViewRef.current?.reload();
+          }}
           style={styles.refreshButton}
         >
           <Text style={[styles.refreshButtonText, { color: colors.primaryBrand }]}>⟳</Text>
@@ -346,9 +371,20 @@ export const PortalScreen: React.FC<PortalScreenProps> = ({ submissionId, onClos
           domStorageEnabled={true}
           sharedCookiesEnabled={true}
           thirdPartyCookiesEnabled={true}
+          mixedContentMode="always"
+          originWhitelist={['*']}
+          userAgent="Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
           onMessage={handleWebViewMessage}
           onLoadStart={() => setLoadingWeb(true)}
           onLoadEnd={() => setLoadingWeb(false)}
+          onError={(syntheticEvent) => {
+            const { nativeEvent } = syntheticEvent;
+            console.warn('[PortalScreen] WebView load error:', nativeEvent);
+            setLoadingWeb(false);
+            if (nativeEvent.description && nativeEvent.description.toLowerCase().includes('ssl')) {
+              setSslErrorOccurred(true);
+            }
+          }}
           onNavigationStateChange={(navState) => {
             setCurrentUrl(navState.url);
           }}
@@ -358,6 +394,35 @@ export const PortalScreen: React.FC<PortalScreenProps> = ({ submissionId, onClos
         {loadingWeb && (
           <View style={styles.webLoader}>
             <ActivityIndicator size="large" color={colors.primaryBrand} />
+          </View>
+        )}
+
+        {/* SSL Warning Helper Banner */}
+        {sslErrorOccurred && (
+          <View style={[styles.sslBanner, { backgroundColor: colors.surface, borderColor: colors.accent }]}>
+            <Text style={[styles.sslBannerTitle, { color: colors.accent }]}>
+              ⚠️ Untrusted Certificate (Govt NIC CA)
+            </Text>
+            <Text style={[styles.sslBannerText, { color: colors.textPrimary }]}>
+              The Indian Form-C portal uses a government certificate authority that Android blocks by default in WebViews.
+            </Text>
+            <View style={styles.sslActionRow}>
+              <TouchableOpacity
+                onPress={handleOpenInSystemBrowser}
+                style={[styles.sslActionButton, { backgroundColor: colors.primaryBrand }]}
+              >
+                <Text style={styles.sslActionButtonText}>Open in Chrome Browser 🌐</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                onPress={() => {
+                  setSslErrorOccurred(false);
+                  webViewRef.current?.reload();
+                }}
+                style={[styles.sslActionButton, { backgroundColor: colors.surfaceSubtle, borderColor: colors.border, borderWidth: 1 }]}
+              >
+                <Text style={[styles.sslActionButtonText, { color: colors.textPrimary }]}>Retry ⟳</Text>
+              </TouchableOpacity>
+            </View>
           </View>
         )}
       </View>
@@ -443,6 +508,46 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     alignItems: 'center',
     backgroundColor: 'rgba(255, 255, 255, 0.4)',
+  },
+  sslBanner: {
+    position: 'absolute',
+    top: 16,
+    left: 16,
+    right: 16,
+    padding: 16,
+    borderRadius: 12,
+    borderWidth: 1.5,
+    elevation: 4,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.2,
+    shadowRadius: 4,
+  },
+  sslBannerTitle: {
+    fontSize: 15,
+    fontWeight: '700',
+    marginBottom: 6,
+  },
+  sslBannerText: {
+    fontSize: 13,
+    lineHeight: 18,
+    marginBottom: 12,
+  },
+  sslActionRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+  },
+  sslActionButton: {
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    borderRadius: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  sslActionButtonText: {
+    color: '#FFFFFF',
+    fontSize: 13,
+    fontWeight: '700',
   },
   bottomBar: {
     height: 64,
