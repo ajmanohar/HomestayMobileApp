@@ -1,0 +1,29 @@
+{
+  "cli": {
+    "version": ">= 12.0.0",
+    "appVersionSource": "remote"
+  },
+  "build": {
+    "development": {
+      "developmentClient": true,
+      "distribution": "internal"
+    },
+    "preview": {
+      "distribution": "internal",
+      "android": {
+        // Tells EAS to generate an installable .apk instead of a Google Play .aab bundle
+        "buildType": "apk"
+      },
+      "env": {
+        // Points your standalone app to your public Cloudflare Tunnel endpoint
+        "EXPO_PUBLIC_API_URL": "https://api.theasymptotebrief.com"
+      }
+    },
+    "production": {
+      "autoIncrement": true
+    }
+  },
+  "submit": {
+    "production": {}
+  }
+}
