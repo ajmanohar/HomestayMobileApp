@@ -1,3 +1,15 @@
+/**
+ * ReviewScreen.tsx
+ * Comprehensive Verification & Edit Screen for Guest Document Extractions.
+ *
+ * Features:
+ * - Top 42%: Pinch-to-zoom / pan document preview synchronized to active document tab.
+ * - Tab Filter: Selectively displays fields for PASSPORT, VISA, STAMP, FORM_C, or ALL.
+ * - Complete Form-C Field Coverage: Handles all 12 items from Form-C (Rule 14),
+ *   plus visa stamps and passport metadata.
+ * - Preserves all manual edits across tabs and saves directly to local SQLite.
+ */
+
 import React, { useState, useEffect } from 'react';
 import {
   View,
@@ -9,9 +21,14 @@ import {
   ScrollView,
   Alert,
   ActivityIndicator,
+  Dimensions,
+  KeyboardAvoidingView,
+  Platform,
 } from 'react-native';
 import { useAppTheme } from '../theme/ThemeContext';
 import { openDatabase, updateSubmissionStatus, GuestDocumentRecord } from '../db/database';
+
+const { width: SCREEN_WIDTH } = Dimensions.get('window');
 
 interface ReviewScreenProps {
   submissionId: string;
@@ -20,28 +37,54 @@ interface ReviewScreenProps {
 }
 
 /**
- * Standard fields mapped from Form-C Arrival Report and Passport Bio data.
+ * Complete Form-C Guest Record covering Passport Bio, Visa/OCI, Entry Stamp,
+ * and all 12 numbered fields of the Arrival Report (Rule 14).
  */
-interface FormCFields {
+export interface CompleteFormCFields {
+  // --- 1. Passport Bio ---
   surname: string;
   givenName: string;
-  passportNumber: string;
-  nationality: string;
+  sex: string;
   dateOfBirth: string;
+  nationality: string;
+  passportNumber: string;
+  passportExpiryDate: string;
+
+  // --- 2. Visa / OCI ---
   visaNumber: string;
+  visaType: string;
+  visaIssueDate: string;
+  visaExpiryDate: string;
+  visaPlaceOfIssue: string;
+
+  // --- 3. Entry Immigration Stamp ---
+  arrivalDateIndia: string;
+  arrivalPortIndia: string;
+
+  // --- 4. Handwritten Form-C Arrival Report (Rule 14) ---
+  permanentAddress: string;
+  city: string;
+  country: string;
+  contactEmail: string;
+  contactPhone: string;
+  arrivalDatetimeHomestay: string;
   arrivedFrom: string;
   proceedingTo: string;
+  stayDurationIndia: string;
   purposeOfVisit: string;
+  expectedDepartureDate: string;
+  arrivedCountryCityIndia: string;
 }
 
-// Available tabs for the top document preview viewer
-type DocumentTabKey = 'passport' | 'visa' | 'stamp' | 'form_c' | 'photo';
+// Available document preview tabs
+type DocumentTabKey = 'passport' | 'visa' | 'stamp' | 'form_c' | 'photo' | 'all';
 
 export const ReviewScreen: React.FC<ReviewScreenProps> = ({
   submissionId,
   onFinishReview,
   onCancel,
 }) => {
+  // Theme context providing dynamic light/dark colors
   const { colors, isDark, toggleTheme } = useAppTheme();
 
   // Screen state
@@ -50,17 +93,37 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
   const [selectedDocTab, setSelectedDocTab] = useState<DocumentTabKey>('passport');
   const [isSaving, setIsSaving] = useState<boolean>(false);
 
-  // Editable Form-C verified fields
-  const [formData, setFormData] = useState<FormCFields>({
+  // Editable Form-C verified fields state
+  const [formData, setFormData] = useState<CompleteFormCFields>({
     surname: '',
     givenName: '',
-    passportNumber: '',
-    nationality: '',
+    sex: '',
     dateOfBirth: '',
+    nationality: '',
+    passportNumber: '',
+    passportExpiryDate: '',
+
     visaNumber: '',
+    visaType: '',
+    visaIssueDate: '',
+    visaExpiryDate: '',
+    visaPlaceOfIssue: '',
+
+    arrivalDateIndia: '',
+    arrivalPortIndia: '',
+
+    permanentAddress: '',
+    city: '',
+    country: '',
+    contactEmail: '',
+    contactPhone: '',
+    arrivalDatetimeHomestay: '',
     arrivedFrom: '',
     proceedingTo: '',
+    stayDurationIndia: '',
     purposeOfVisit: '',
+    expectedDepartureDate: '',
+    arrivedCountryCityIndia: '',
   });
 
   /**
@@ -72,7 +135,7 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
         setLoading(true);
         const db = await openDatabase();
 
-        // 1. Fetch document record associated with this submission
+        // Query guest document record for this submission
         const docs = await db.getAllAsync<GuestDocumentRecord>(
           `SELECT * FROM guest_documents WHERE submission_id = ? ORDER BY guest_index ASC LIMIT 1;`,
           [submissionId]
@@ -82,47 +145,55 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
           const doc = docs[0];
           setGuestDoc(doc);
 
-          // 2. Parse extracted OCR JSON if available
           if (doc.extracted_data_json) {
             try {
               const parsed = JSON.parse(doc.extracted_data_json);
 
-              // Helper function to safely extract string values whether flat or wrapped in FieldResult { value, confidence }
-              const extractVal = (field: any): string => {
+              // Helper function to extract string values whether flat or wrapped in { value, confidence }
+              const extractVal = (field: any, fallback: string = ''): string => {
                 if (field === null || field === undefined) {
-                  return '';
+                  return fallback;
                 }
-                // If backend wrapped the field in a FieldResult object { value: "...", confidence: 0.8 }
                 if (typeof field === 'object' && 'value' in field) {
-                  return field.value !== null && field.value !== undefined ? String(field.value) : '';
+                  return field.value !== null && field.value !== undefined ? String(field.value) : fallback;
                 }
-                // If backend sent a raw primitive (string, number)
                 return String(field);
               };
 
               setFormData({
-                // Surname extraction supporting both standard and fallback keys
+                // Passport fields
                 surname: extractVal(parsed.surname || parsed.last_name),
-
-                // Given names extraction supporting plural (backend standard) and singular
                 givenName: extractVal(parsed.given_names || parsed.given_name || parsed.first_name),
-
-                // Passport number extraction supporting standard key variations
-                passportNumber: extractVal(parsed.passport_number || parsed.passport_no || parsed.pass_num),
-
-                // Nationality extraction
-                nationality: extractVal(parsed.nationality),
-
-                // Date of birth extraction supporting standard key variations
+                sex: extractVal(parsed.sex),
                 dateOfBirth: extractVal(parsed.date_of_birth || parsed.dob),
+                nationality: extractVal(parsed.nationality),
+                passportNumber: extractVal(parsed.passport_number || parsed.passport_no || parsed.pass_num),
+                passportExpiryDate: extractVal(parsed.passport_expiry_date || parsed.expiry_date),
 
-                // Visa number extraction supporting standard key variations
+                // Visa fields
                 visaNumber: extractVal(parsed.visa_number || parsed.visa_no || parsed.visa_num),
+                visaType: extractVal(parsed.visa_type, 'TOURIST'),
+                visaIssueDate: extractVal(parsed.visa_issue_date || parsed.issue_date),
+                visaExpiryDate: extractVal(parsed.visa_expiry_date),
+                visaPlaceOfIssue: extractVal(parsed.visa_place_of_issue || parsed.place_of_issue),
 
-                // Arrival slip fields (Form-C Rule 14)
+                // Stamp fields
+                arrivalDateIndia: extractVal(parsed.arrival_date_india || parsed.arrival_date),
+                arrivalPortIndia: extractVal(parsed.arrival_port_india || parsed.arrival_port),
+
+                // Form-C Arrival Report fields
+                permanentAddress: extractVal(parsed.permanent_address || parsed.full_address),
+                city: extractVal(parsed.city),
+                country: extractVal(parsed.country),
+                contactEmail: extractVal(parsed.contact_email || parsed.email),
+                contactPhone: extractVal(parsed.contact_phone || parsed.telephone_mobile),
+                arrivalDatetimeHomestay: extractVal(parsed.arrival_datetime_homestay || parsed.datetime_arrival_homestay),
                 arrivedFrom: extractVal(parsed.arrived_from || parsed.arri_from),
                 proceedingTo: extractVal(parsed.proceeding_to || parsed.proc_to),
-                purposeOfVisit: extractVal(parsed.purpose_of_visit || 'Tourism'),
+                stayDurationIndia: extractVal(parsed.stay_duration_india || parsed.proposed_duration_stay_india),
+                purposeOfVisit: extractVal(parsed.purpose_of_visit || parsed.purpose_of_visit_profession, 'Tourism'),
+                expectedDepartureDate: extractVal(parsed.expected_departure_date || parsed.expected_date_departure),
+                arrivedCountryCityIndia: extractVal(parsed.arrived_country_city_india || parsed.country_city_arrived_to_india),
               });
             } catch (err) {
               console.warn('[ReviewScreen] Could not parse extracted JSON payload:', err);
@@ -140,28 +211,28 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
   }, [submissionId]);
 
   /**
-   * Helper to update specific field values in form state.
+   * Updates specific field value in state.
    */
-  const handleFieldChange = (field: keyof FormCFields, value: string) => {
+  const handleFieldChange = (field: keyof CompleteFormCFields, value: string) => {
     setFormData((prev) => ({ ...prev, [field]: value }));
   };
 
   /**
-   * Persists verified values back to SQLite and marks submission status as 'REVIEWED'.
+   * Persists verified values back to SQLite and marks submission as 'REVIEWED'.
    */
   const handleSaveAndConfirm = async () => {
     try {
       setIsSaving(true);
       const db = await openDatabase();
 
-      // 1. Persist updated JSON values into guest_documents
+      // Persist full JSON into guest_documents table
       const updatedJson = JSON.stringify(formData);
       await db.runAsync(
         `UPDATE guest_documents SET extracted_data_json = ? WHERE submission_id = ?;`,
         [updatedJson, submissionId]
       );
 
-      // 2. Advance submission state to REVIEWED
+      // Advance submission state to REVIEWED
       await updateSubmissionStatus(submissionId, 'REVIEWED');
 
       setIsSaving(false);
@@ -175,8 +246,7 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
   };
 
   /**
-   * Determines active document image URI based on selected tab,
-   * including the dedicated guest portrait photo.
+   * Resolves active document image path based on selected preview tab.
    */
   const getActiveImageUri = (): string | undefined => {
     if (!guestDoc) return undefined;
@@ -191,6 +261,8 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
         return guestDoc.form_c_path;
       case 'photo':
         return guestDoc.guest_photo_path;
+      case 'all':
+        return guestDoc.passport_bio_path;
       default:
         return guestDoc.passport_bio_path;
     }
@@ -206,197 +278,210 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
 
   const activeImage = getActiveImageUri();
 
+  // Helper renderer for an individual form text field
+  const renderField = (label: string, fieldKey: keyof CompleteFormCFields, placeholder: string) => (
+    <View style={styles.fieldGroup} key={fieldKey}>
+      <Text style={[styles.label, { color: colors.textMuted }]}>{label}</Text>
+      <TextInput
+        style={[
+          styles.input,
+          {
+            backgroundColor: colors.surface,
+            color: colors.textPrimary,
+            borderColor: colors.border,
+          },
+        ]}
+        value={formData[fieldKey]}
+        onChangeText={(text) => handleFieldChange(fieldKey, text)}
+        placeholder={placeholder}
+        placeholderTextColor={colors.textMuted}
+        autoCapitalize="characters"
+      />
+    </View>
+  );
+
   return (
     <View style={[styles.container, { backgroundColor: colors.background }]}>
-      {/* Top Header Bar */}
-      <View style={[styles.headerBar, { backgroundColor: colors.surface, borderBottomColor: colors.border }]}>
-        <TouchableOpacity onPress={onCancel} style={styles.headerButton}>
-          <Text style={[styles.headerButtonText, { color: colors.textMuted }]}>Close</Text>
-        </TouchableOpacity>
-        <Text style={[styles.headerTitle, { color: colors.textPrimary }]}>Verify Document</Text>
-        <TouchableOpacity onPress={toggleTheme} style={styles.themeToggle}>
-          <Text style={styles.themeToggleText}>{isDark ? '☀️' : '🌙'}</Text>
-        </TouchableOpacity>
-      </View>
+      <KeyboardAvoidingView
+        style={styles.keyboardContainer}
+        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+      >
+        {/* Top Header Bar */}
+        <View style={[styles.headerBar, { backgroundColor: colors.surface, borderBottomColor: colors.border }]}>
+          <TouchableOpacity onPress={onCancel} style={styles.headerButton}>
+            <Text style={[styles.headerButtonText, { color: colors.textMuted }]}>Close</Text>
+          </TouchableOpacity>
+          <Text style={[styles.headerTitle, { color: colors.textPrimary }]}>Verify Document</Text>
+          <TouchableOpacity onPress={toggleTheme} style={styles.themeToggle}>
+            <Text style={styles.themeToggleText}>{isDark ? '☀️' : '🌙'}</Text>
+          </TouchableOpacity>
+        </View>
 
-      {/* Top 45%: Document Preview Canvas */}
-      <View style={[styles.imageViewerSection, { backgroundColor: colors.surfaceSubtle }]}>
-        {/* Document Switcher Tabs */}
-        <View style={styles.tabRow}>
-          {(['passport', 'visa', 'stamp', 'form_c', 'photo'] as const).map((tabKey) => (
-            <TouchableOpacity
-              key={tabKey}
-              onPress={() => setSelectedDocTab(tabKey)}
-              style={[
-                styles.tabButton,
-                {
-                  borderBottomColor:
-                    selectedDocTab === tabKey ? colors.primaryBrand : 'transparent',
-                },
-              ]}
-            >
-              <Text
+        {/* Top 42%: Pinch-to-Zoom Document Preview */}
+        <View style={[styles.imageViewerSection, { backgroundColor: colors.surfaceSubtle }]}>
+          {/* Document Switcher Tabs */}
+          <View style={styles.tabRow}>
+            {(['passport', 'visa', 'stamp', 'form_c', 'photo', 'all'] as const).map((tabKey) => (
+              <TouchableOpacity
+                key={tabKey}
+                onPress={() => setSelectedDocTab(tabKey)}
                 style={[
-                  styles.tabButtonText,
+                  styles.tabButton,
                   {
-                    color: selectedDocTab === tabKey ? colors.primaryBrand : colors.textMuted,
-                    fontWeight: selectedDocTab === tabKey ? '700' : '500',
+                    borderBottomColor:
+                      selectedDocTab === tabKey ? colors.primaryBrand : 'transparent',
                   },
                 ]}
               >
-                {tabKey.toUpperCase()}
-              </Text>
-            </TouchableOpacity>
-          ))}
+                <Text
+                  style={[
+                    styles.tabButtonText,
+                    {
+                      color: selectedDocTab === tabKey ? colors.primaryBrand : colors.textMuted,
+                      fontWeight: selectedDocTab === tabKey ? '700' : '500',
+                    },
+                  ]}
+                >
+                  {tabKey === 'form_c' ? 'FORM-C' : tabKey.toUpperCase()}
+                </Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+
+          {/* Pinch-to-Zoom Scroll Container */}
+          <View style={styles.imageWrapper}>
+            {activeImage ? (
+              <ScrollView
+                style={styles.zoomScrollView}
+                contentContainerStyle={styles.zoomContentContainer}
+                maximumZoomScale={4.0}
+                minimumZoomScale={1.0}
+                showsHorizontalScrollIndicator={false}
+                showsVerticalScrollIndicator={false}
+                centerContent={true}
+              >
+                <Image
+                  source={{ uri: activeImage }}
+                  style={styles.previewImage}
+                  resizeMode="contain"
+                />
+              </ScrollView>
+            ) : (
+              <View style={styles.emptyImageContainer}>
+                <Text style={[styles.emptyImageText, { color: colors.textMuted }]}>
+                  No image available for this document
+                </Text>
+              </View>
+            )}
+            <View style={styles.zoomHintBadge}>
+              <Text style={styles.zoomHintText}>🔍 Pinch to zoom</Text>
+            </View>
+          </View>
         </View>
 
-        {/* Scaled Document Canvas */}
-        <View style={styles.imageWrapper}>
-          {activeImage ? (
-            <Image source={{ uri: activeImage }} style={styles.previewImage} resizeMode="contain" />
-          ) : (
-            <View style={styles.emptyImageContainer}>
-              <Text style={[styles.emptyImageText, { color: colors.textMuted }]}>
-                No image available for this document
+        {/* Bottom 58%: Tab-Filtered Editable Form Fields */}
+        <ScrollView contentContainerStyle={styles.formContent} keyboardShouldPersistTaps="handled">
+          {/* Section: PASSPORT */}
+          {(selectedDocTab === 'passport' || selectedDocTab === 'all') && (
+            <View style={styles.sectionContainer}>
+              <Text style={[styles.sectionHeading, { color: colors.primaryBrand }]}>
+                🛂 Passport / Identity Details
               </Text>
+              {renderField('Surname (As in Passport)', 'surname', 'e.g. DOE')}
+              {renderField('Given Name(s)', 'givenName', 'e.g. JOHN BAUER')}
+              {renderField('Sex (M / F / O)', 'sex', 'M')}
+              {renderField('Date of Birth (YYYY-MM-DD)', 'dateOfBirth', 'YYYY-MM-DD')}
+              {renderField('Nationality', 'nationality', 'e.g. American')}
+              {renderField('Passport Number', 'passportNumber', 'e.g. A12345678')}
+              {renderField('Passport Expiry Date', 'passportExpiryDate', 'YYYY-MM-DD')}
             </View>
           )}
-        </View>
-      </View>
 
-      {/* Bottom 55%: Scrollable Verification Form */}
-      <ScrollView contentContainerStyle={styles.formContent}>
-        <Text style={[styles.sectionHeading, { color: colors.textPrimary }]}>
-          Form-C Foreigner Details
-        </Text>
-
-        {/* Given Name */}
-        <View style={styles.fieldGroup}>
-          <Text style={[styles.label, { color: colors.textMuted }]}>Given Name(s)</Text>
-          <TextInput
-            style={[styles.input, { backgroundColor: colors.surface, color: colors.textPrimary, borderColor: colors.border }]}
-            value={formData.givenName}
-            onChangeText={(text) => handleFieldChange('givenName', text)}
-            placeholder="Given Name"
-            placeholderTextColor={colors.textMuted}
-          />
-        </View>
-
-        {/* Surname */}
-        <View style={styles.fieldGroup}>
-          <Text style={[styles.label, { color: colors.textMuted }]}>Surname</Text>
-          <TextInput
-            style={[styles.input, { backgroundColor: colors.surface, color: colors.textPrimary, borderColor: colors.border }]}
-            value={formData.surname}
-            onChangeText={(text) => handleFieldChange('surname', text)}
-            placeholder="Surname"
-            placeholderTextColor={colors.textMuted}
-          />
-        </View>
-
-        {/* Passport Number */}
-        <View style={styles.fieldGroup}>
-          <Text style={[styles.label, { color: colors.textMuted }]}>Passport Number</Text>
-          <TextInput
-            style={[styles.input, { backgroundColor: colors.surface, color: colors.textPrimary, borderColor: colors.border }]}
-            value={formData.passportNumber}
-            onChangeText={(text) => handleFieldChange('passportNumber', text)}
-            placeholder="Passport Number"
-            placeholderTextColor={colors.textMuted}
-          />
-        </View>
-
-        {/* Nationality */}
-        <View style={styles.fieldGroup}>
-          <Text style={[styles.label, { color: colors.textMuted }]}>Nationality</Text>
-          <TextInput
-            style={[styles.input, { backgroundColor: colors.surface, color: colors.textPrimary, borderColor: colors.border }]}
-            value={formData.nationality}
-            onChangeText={(text) => handleFieldChange('nationality', text)}
-            placeholder="Nationality"
-            placeholderTextColor={colors.textMuted}
-          />
-        </View>
-
-        {/* Date of Birth */}
-        <View style={styles.fieldGroup}>
-          <Text style={[styles.label, { color: colors.textMuted }]}>Date of Birth (DD/MM/YYYY)</Text>
-          <TextInput
-            style={[styles.input, { backgroundColor: colors.surface, color: colors.textPrimary, borderColor: colors.border }]}
-            value={formData.dateOfBirth}
-            onChangeText={(text) => handleFieldChange('dateOfBirth', text)}
-            placeholder="DD/MM/YYYY"
-            placeholderTextColor={colors.textMuted}
-          />
-        </View>
-
-        {/* Visa / OCI Number */}
-        <View style={styles.fieldGroup}>
-          <Text style={[styles.label, { color: colors.textMuted }]}>Visa / OCI Number</Text>
-          <TextInput
-            style={[styles.input, { backgroundColor: colors.surface, color: colors.textPrimary, borderColor: colors.border }]}
-            value={formData.visaNumber}
-            onChangeText={(text) => handleFieldChange('visaNumber', text)}
-            placeholder="Visa Number"
-            placeholderTextColor={colors.textMuted}
-          />
-        </View>
-
-        {/* Arrived From */}
-        <View style={styles.fieldGroup}>
-          <Text style={[styles.label, { color: colors.textMuted }]}>Arrived From (City / Country)</Text>
-          <TextInput
-            style={[styles.input, { backgroundColor: colors.surface, color: colors.textPrimary, borderColor: colors.border }]}
-            value={formData.arrivedFrom}
-            onChangeText={(text) => handleFieldChange('arrivedFrom', text)}
-            placeholder="e.g. London, UK"
-            placeholderTextColor={colors.textMuted}
-          />
-        </View>
-
-        {/* Proceeding To */}
-        <View style={styles.fieldGroup}>
-          <Text style={[styles.label, { color: colors.textMuted }]}>Proceeding To (Destination)</Text>
-          <TextInput
-            style={[styles.input, { backgroundColor: colors.surface, color: colors.textPrimary, borderColor: colors.border }]}
-            value={formData.proceedingTo}
-            onChangeText={(text) => handleFieldChange('proceedingTo', text)}
-            placeholder="e.g. Munnar, Kerala"
-            placeholderTextColor={colors.textMuted}
-          />
-        </View>
-
-        {/* Purpose of Visit */}
-        <View style={styles.fieldGroup}>
-          <Text style={[styles.label, { color: colors.textMuted }]}>Purpose of Visit</Text>
-          <TextInput
-            style={[styles.input, { backgroundColor: colors.surface, color: colors.textPrimary, borderColor: colors.border }]}
-            value={formData.purposeOfVisit}
-            onChangeText={(text) => handleFieldChange('purposeOfVisit', text)}
-            placeholder="e.g. Tourism"
-            placeholderTextColor={colors.textMuted}
-          />
-        </View>
-
-        {/* Confirm & Save Button */}
-        <TouchableOpacity
-          disabled={isSaving}
-          onPress={handleSaveAndConfirm}
-          style={[styles.confirmButton, { backgroundColor: colors.statusReady }]}
-        >
-          {isSaving ? (
-            <ActivityIndicator color="#FFFFFF" />
-          ) : (
-            <Text style={styles.confirmButtonText}>Confirm & Mark Reviewed</Text>
+          {/* Section: VISA */}
+          {(selectedDocTab === 'visa' || selectedDocTab === 'all') && (
+            <View style={styles.sectionContainer}>
+              <Text style={[styles.sectionHeading, { color: colors.primaryBrand }]}>
+                📑 Visa / OCI Details
+              </Text>
+              {renderField('Visa / OCI Number', 'visaNumber', 'e.g. V1234567')}
+              {renderField('Visa Type', 'visaType', 'e.g. TOURIST')}
+              {renderField('Visa Issue Date', 'visaIssueDate', 'YYYY-MM-DD')}
+              {renderField('Visa Expiry Date', 'visaExpiryDate', 'YYYY-MM-DD')}
+              {renderField('Visa Place of Issue', 'visaPlaceOfIssue', 'e.g. LONDON')}
+            </View>
           )}
-        </TouchableOpacity>
-      </ScrollView>
+
+          {/* Section: STAMP */}
+          {(selectedDocTab === 'stamp' || selectedDocTab === 'all') && (
+            <View style={styles.sectionContainer}>
+              <Text style={[styles.sectionHeading, { color: colors.primaryBrand }]}>
+                🛬 Entry Immigration Stamp
+              </Text>
+              {renderField('Date of Arrival in India', 'arrivalDateIndia', 'YYYY-MM-DD')}
+              {renderField('Port of Arrival in India', 'arrivalPortIndia', 'e.g. COCHIN AIRPORT')}
+            </View>
+          )}
+
+          {/* Section: FORM-C ARRIVAL REPORT (Rule 14) */}
+          {(selectedDocTab === 'form_c' || selectedDocTab === 'all') && (
+            <View style={styles.sectionContainer}>
+              <Text style={[styles.sectionHeading, { color: colors.primaryBrand }]}>
+                📝 Form-C Arrival Report (Rule 14)
+              </Text>
+              {renderField('Permanent Address in Country of Residence', 'permanentAddress', 'Street address')}
+              {renderField('City', 'city', 'City')}
+              {renderField('Country', 'country', 'Country of residence')}
+              {renderField('Email Address', 'contactEmail', 'guest@example.com')}
+              {renderField('Telephone / Mobile Number', 'contactPhone', '+1 234 567 8900')}
+              {renderField('Date & Time of Arrival in Homestay', 'arrivalDatetimeHomestay', 'YYYY-MM-DD HH:MM')}
+              {renderField('Arrived From (City / Country)', 'arrivedFrom', 'e.g. London, UK')}
+              {renderField('Proceeding To (Destination)', 'proceedingTo', 'e.g. Munnar, Kerala')}
+              {renderField('Proposed Duration of Stay in India', 'stayDurationIndia', 'e.g. 14 Days')}
+              {renderField('Purpose of Visit & Profession', 'purposeOfVisit', 'Tourism')}
+              {renderField('Expected Date of Departure', 'expectedDepartureDate', 'YYYY-MM-DD')}
+              {renderField('Country & City You Arrived to India', 'arrivedCountryCityIndia', 'e.g. UK, London')}
+            </View>
+          )}
+
+          {/* Section: PHOTO */}
+          {selectedDocTab === 'photo' && (
+            <View style={styles.sectionContainer}>
+              <Text style={[styles.sectionHeading, { color: colors.primaryBrand }]}>
+                👤 Guest Portrait Photo
+              </Text>
+              <Text style={[styles.helperText, { color: colors.textMuted }]}>
+                Passport portrait photo cropped for portal upload. You can edit guest names below:
+              </Text>
+              {renderField('Given Name(s)', 'givenName', 'e.g. JOHN')}
+              {renderField('Surname', 'surname', 'e.g. DOE')}
+            </View>
+          )}
+
+          {/* Confirm & Save Button */}
+          <TouchableOpacity
+            disabled={isSaving}
+            onPress={handleSaveAndConfirm}
+            style={[styles.confirmButton, { backgroundColor: colors.statusReady }]}
+          >
+            {isSaving ? (
+              <ActivityIndicator color="#FFFFFF" />
+            ) : (
+              <Text style={styles.confirmButtonText}>Confirm & Mark Reviewed ✓</Text>
+            )}
+          </TouchableOpacity>
+
+          <View style={{ height: 40 }} />
+        </ScrollView>
+      </KeyboardAvoidingView>
     </View>
   );
 };
 
 const styles = StyleSheet.create({
   container: {
+    flex: 1,
+  },
+  keyboardContainer: {
     flex: 1,
   },
   centerContainer: {
@@ -431,19 +516,20 @@ const styles = StyleSheet.create({
   imageViewerSection: {
     height: '42%',
     borderBottomWidth: 1,
-    borderBottomColor: '#E2E8F0',
+    borderBottomColor: '#CBD5E1',
+    position: 'relative',
   },
   tabRow: {
     flexDirection: 'row',
     justifyContent: 'space-around',
-    height: 38,
+    height: 40,
     borderBottomWidth: 1,
-    borderBottomColor: '#E2E8F0',
+    borderBottomColor: '#CBD5E1',
   },
   tabButton: {
     justifyContent: 'center',
     alignItems: 'center',
-    paddingHorizontal: 6,
+    paddingHorizontal: 4,
     borderBottomWidth: 2,
   },
   tabButtonText: {
@@ -451,37 +537,67 @@ const styles = StyleSheet.create({
   },
   imageWrapper: {
     flex: 1,
-    alignItems: 'center',
+    position: 'relative',
+  },
+  zoomScrollView: {
+    flex: 1,
+  },
+  zoomContentContainer: {
+    width: SCREEN_WIDTH,
+    minHeight: '100%',
     justifyContent: 'center',
-    padding: 8,
+    alignItems: 'center',
   },
   previewImage: {
-    width: '100%',
-    height: '100%',
+    width: SCREEN_WIDTH,
+    height: 220,
   },
   emptyImageContainer: {
+    flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
   },
   emptyImageText: {
     fontSize: 13,
   },
+  zoomHintBadge: {
+    position: 'absolute',
+    bottom: 8,
+    right: 8,
+    backgroundColor: 'rgba(0, 0, 0, 0.65)',
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 4,
+  },
+  zoomHintText: {
+    color: '#FFFFFF',
+    fontSize: 10,
+    fontWeight: '600',
+  },
   formContent: {
     padding: 16,
     paddingBottom: 48,
   },
+  sectionContainer: {
+    marginBottom: 8,
+  },
   sectionHeading: {
-    fontSize: 16,
+    fontSize: 15,
     fontWeight: '700',
-    marginBottom: 16,
+    marginBottom: 12,
+    marginTop: 4,
+  },
+  helperText: {
+    fontSize: 12,
+    marginBottom: 10,
   },
   fieldGroup: {
-    marginBottom: 14,
+    marginBottom: 12,
   },
   label: {
-    fontSize: 13,
+    fontSize: 12,
     marginBottom: 4,
-    fontWeight: '500',
+    fontWeight: '600',
   },
   input: {
     height: 44,
@@ -491,11 +607,12 @@ const styles = StyleSheet.create({
     fontSize: 14,
   },
   confirmButton: {
-    height: 48,
+    height: 50,
     borderRadius: 8,
     alignItems: 'center',
     justifyContent: 'center',
     marginTop: 16,
+    marginBottom: 16,
   },
   confirmButtonText: {
     color: '#FFFFFF',
@@ -503,3 +620,5 @@ const styles = StyleSheet.create({
     fontWeight: '700',
   },
 });
+
+export default ReviewScreen;
