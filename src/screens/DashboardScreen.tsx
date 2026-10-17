@@ -20,7 +20,7 @@ import {
   GuestDocumentRecord,
   SubmissionStatus,
 } from '../db/database';
-import { runFullSync } from '../services/syncManager';
+import { runFullSync, pollJobUntilComplete } from '../services/syncManager';
 import { submitGuestDocuments } from '../services/apiService';
 import {
   getPortalCredentials,
@@ -39,9 +39,10 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
   onOpenReview,
   onOpenPortal,
 }) => {
+  // Theme styling tokens (supports dark / light mode toggle)
   const { colors, isDark, toggleTheme } = useAppTheme();
 
-  // Screen queue state
+  // Screen queue and processing states
   const [submissions, setSubmissions] = useState<SubmissionRecord[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [refreshing, setRefreshing] = useState<boolean>(false);
@@ -136,11 +137,12 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
   };
 
   /**
-   * Allows manual single-card retry when a submission is stuck in UPLOAD_PENDING.
+   * Resubmits an existing submission for processing without re-capturing images.
+   * Can be invoked from UPLOAD_PENDING, PENDING_REVIEW, or REVIEWED states.
    *
-   * @param item - The target submission record to retry
+   * @param item - The submission record to re-extract
    */
-  const handleRetryUpload = async (item: SubmissionRecord) => {
+  const handleTriggerReExtract = async (item: SubmissionRecord) => {
     if (!item || !item.id) {
       Alert.alert('Error', 'Invalid submission record ID.');
       return;
@@ -148,25 +150,25 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
 
     try {
       setRetryingId(item.id);
-      console.log(`[Dashboard] Starting retry upload for submission ID: ${item.id}`);
+      console.log(`[Dashboard] Starting re-extraction for submission ID: ${item.id}`);
 
       const db = await openDatabase();
       const safeSubmissionId = String(item.id).trim();
 
-      // Fetch document record associated with this submission
+      // Retrieve locally stored image paths for this guest record
       const docs = await db.getAllAsync<GuestDocumentRecord>(
         'SELECT * FROM guest_documents WHERE submission_id = ? LIMIT 1;',
         [safeSubmissionId]
       );
 
       if (!docs || docs.length === 0) {
-        Alert.alert('Error', 'No document images found for this submission.');
+        Alert.alert('Error', 'No document images found on device for this submission.');
         return;
       }
 
       const guestDoc = docs[0];
 
-      // Post multipart upload to backend API (guest portrait stays local on device)
+      // Dispatch existing captured artifacts directly to backend FastAPI endpoint
       const response = await submitGuestDocuments(
         guestDoc.passport_bio_path,
         guestDoc.visa_stamp_path ?? undefined,
@@ -175,28 +177,33 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
         item.reference ?? undefined
       );
 
-      console.log(`[Dashboard] Upload succeeded with job_id: ${response.job_id}`);
+      console.log(`[Dashboard] Re-upload succeeded with job_id: ${response.job_id}`);
 
-      // Advance status to PROCESSING with returned job_id
+      // Transition local SQLite status back to PROCESSING with new server job_id
       await updateSubmissionStatus(safeSubmissionId, 'PROCESSING', response.job_id);
       await loadSubmissions();
 
+      // Kick off background polling loop so it auto-transitions to PENDING_REVIEW when done
+      pollJobUntilComplete(safeSubmissionId, response.job_id)
+        .then(() => loadSubmissions())
+        .catch((err) => console.warn('[Dashboard] Background polling error:', err));
+
       Alert.alert(
-        'Upload Successful',
-        `Job registered on server with ID: ${response.job_id}. Processing has started.`
+        'Processing Initiated',
+        `Job dispatched to server with ID: ${response.job_id.slice(0, 8)}... Data will refresh automatically.`
       );
     } catch (error: any) {
-      console.error(`[Dashboard] Retry upload failed for ${item.id}:`, error);
+      console.error(`[Dashboard] Re-extraction request failed for ${item.id}:`, error);
       Alert.alert(
-        'Upload Failed',
-        `Server communication failed: ${error.message || error}.\n\nPlease ensure your server and Cloudflare tunnel are active, then tap to retry.`
+        'Submission Failed',
+        `Could not reach extraction service: ${error.message || error}`
       );
     } finally {
       setRetryingId(null);
     }
   };
 
-  // Initial load on mount
+  // Initial load of SQLite submissions on mount
   useEffect(() => {
     loadSubmissions();
   }, [loadSubmissions]);
@@ -237,35 +244,31 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
   };
 
   /**
-   * Card press router:
-   * - If REVIEWED: opens the Form-C portal runner screen.
-   * - If PENDING_REVIEW: opens split-screen verification.
-   * - If UPLOAD_PENDING: triggers immediate retry upload.
+   * Main card body press router:
+   * - If REVIEWED or PENDING_REVIEW: opens review verification editor.
+   * - If UPLOAD_PENDING: triggers submission upload.
    */
   const handleCardPress = (item: SubmissionRecord) => {
-    if (item.status === 'REVIEWED') {
-      onOpenPortal(item.id);
-    } else if (item.status === 'PENDING_REVIEW') {
+    if (item.status === 'REVIEWED' || item.status === 'PENDING_REVIEW') {
       onOpenReview(item.id);
     } else if (item.status === 'UPLOAD_PENDING') {
-      handleRetryUpload(item);
+      handleTriggerReExtract(item);
     }
   };
 
   /**
-   * Renders each individual submission item with explicit feedback cues.
+   * Renders each individual submission card with explicit actionable options.
    */
   const renderSubmissionItem = ({ item }: { item: SubmissionRecord }) => {
     const badge = getStatusBadgeStyle(item.status);
     const isReadyForReview = item.status === 'PENDING_REVIEW';
     const isReviewed = item.status === 'REVIEWED';
     const isUploadPending = item.status === 'UPLOAD_PENDING';
-    const isThisCardRetrying = retryingId === item.id;
+    const isProcessing = item.status === 'PROCESSING';
+    const isThisCardActive = retryingId === item.id;
 
     return (
-      <TouchableOpacity
-        activeOpacity={0.7}
-        onPress={() => handleCardPress(item)}
+      <View
         style={[
           styles.submissionCard,
           {
@@ -274,50 +277,111 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
           },
         ]}
       >
-        <View style={styles.cardHeaderRow}>
-          <Text style={[styles.referenceText, { color: colors.textPrimary }]} numberOfLines={1}>
-            {item.reference || 'Homestay Guest Capture'}
-          </Text>
-          <View style={[styles.statusBadge, { backgroundColor: badge.backgroundColor }]}>
-            <Text style={styles.statusBadgeText}>{badge.label}</Text>
+        {/* Card Header & Metadata (Tap to view/edit) */}
+        <TouchableOpacity
+          activeOpacity={0.7}
+          onPress={() => handleCardPress(item)}
+        >
+          <View style={styles.cardHeaderRow}>
+            <Text style={[styles.referenceText, { color: colors.textPrimary }]} numberOfLines={1}>
+              {item.reference || 'Homestay Guest Capture'}
+            </Text>
+            <View style={[styles.statusBadge, { backgroundColor: badge.backgroundColor }]}>
+              <Text style={styles.statusBadgeText}>{badge.label}</Text>
+            </View>
           </View>
-        </View>
 
-        <View style={styles.cardMetaRow}>
-          <Text style={[styles.metaLabel, { color: colors.textMuted }]}>
-            ID: <Text style={{ color: colors.textPrimary }}>{item.id.slice(0, 16)}...</Text>
-          </Text>
-          <Text style={[styles.metaLabel, { color: colors.textMuted }]}>
-            {item.guest_count} Guest{item.guest_count > 1 ? 's' : ''}
-          </Text>
-        </View>
+          <View style={styles.cardMetaRow}>
+            <Text style={[styles.metaLabel, { color: colors.textMuted }]}>
+              ID: <Text style={{ color: colors.textPrimary }}>{item.id.slice(0, 16)}...</Text>
+            </Text>
+            <Text style={[styles.metaLabel, { color: colors.textMuted }]}>
+              {item.guest_count} Guest{item.guest_count > 1 ? 's' : ''}
+            </Text>
+          </View>
 
-        <View style={styles.cardFooterRow}>
-          <Text style={[styles.dateText, { color: colors.textMuted }]}>
-            {formatDate(item.created_at)}
-          </Text>
+          <View style={styles.dateRow}>
+            <Text style={[styles.dateText, { color: colors.textMuted }]}>
+              {formatDate(item.created_at)}
+            </Text>
+          </View>
+        </TouchableOpacity>
 
-          {isThisCardRetrying ? (
-            <ActivityIndicator size="small" color={colors.accent} />
+        {/* Action Button Strip */}
+        <View style={[styles.cardFooterActions, { borderTopColor: colors.border }]}>
+          {isThisCardActive ? (
+            <View style={styles.centeredRow}>
+              <ActivityIndicator size="small" color={colors.accent} />
+              <Text style={[styles.processingText, { color: colors.accent }]}> Submitting...</Text>
+            </View>
           ) : isUploadPending ? (
-            <Text style={[styles.actionPromptText, { color: colors.accent }]}>
-              Tap to Retry Upload ⟳
-            </Text>
+            <TouchableOpacity onPress={() => handleTriggerReExtract(item)} style={styles.singleActionButton}>
+              <Text style={[styles.actionPromptText, { color: colors.accent }]}>
+                Tap to Send for Extraction ⟳
+              </Text>
+            </TouchableOpacity>
+          ) : isProcessing ? (
+            <View style={styles.centeredRow}>
+              <ActivityIndicator size="small" color={colors.primaryBrand} />
+              <Text style={[styles.processingText, { color: colors.primaryBrand }]}>
+                {' '}AI extraction in progress...
+              </Text>
+            </View>
           ) : isReadyForReview ? (
-            <Text style={[styles.actionPromptText, { color: colors.statusReady }]}>
-              Tap to Verify →
-            </Text>
+            <View style={styles.splitActionRow}>
+              {/* Secondary button: Re-run extraction using existing pictures */}
+              <TouchableOpacity
+                onPress={() => handleTriggerReExtract(item)}
+                style={[styles.smallButton, { backgroundColor: colors.surfaceSubtle, borderColor: colors.border }]}
+              >
+                <Text style={[styles.smallButtonText, { color: colors.textMuted }]}>⟳ Re-run</Text>
+              </TouchableOpacity>
+
+              {/* Primary button: Open review editor */}
+              <TouchableOpacity
+                onPress={() => onOpenReview(item.id)}
+                style={[styles.smallButton, { backgroundColor: colors.statusReady, marginLeft: 8 }]}
+              >
+                <Text style={[styles.smallButtonText, { color: '#FFFFFF', fontWeight: '700' }]}>
+                  Verify Details →
+                </Text>
+              </TouchableOpacity>
+            </View>
           ) : isReviewed ? (
-            <Text style={[styles.actionPromptText, { color: colors.statusDone }]}>
-              Open Form-C Portal ↗
-            </Text>
+            <View style={styles.splitActionRow}>
+              {/* Re-run extraction button */}
+              <TouchableOpacity
+                onPress={() => handleTriggerReExtract(item)}
+                style={[styles.smallButton, { backgroundColor: colors.surfaceSubtle, borderColor: colors.border }]}
+              >
+                <Text style={[styles.smallButtonText, { color: colors.textMuted }]}>⟳ Re-run</Text>
+              </TouchableOpacity>
+
+              {/* Edit button */}
+              <TouchableOpacity
+                onPress={() => onOpenReview(item.id)}
+                style={[styles.smallButton, { backgroundColor: colors.surfaceSubtle, borderColor: colors.border, marginLeft: 8 }]}
+              >
+                <Text style={[styles.smallButtonText, { color: colors.textPrimary }]}>✏️ Edit</Text>
+              </TouchableOpacity>
+
+              {/* Open Form-C Portal Runner */}
+              <TouchableOpacity
+                onPress={() => onOpenPortal(item.id)}
+                style={[styles.smallButton, { backgroundColor: colors.primaryBrand, marginLeft: 8 }]}
+              >
+                <Text style={[styles.smallButtonText, { color: '#FFFFFF', fontWeight: '700' }]}>
+                  🚀 Portal
+                </Text>
+              </TouchableOpacity>
+            </View>
           ) : (
             <Text style={[styles.actionPromptText, { color: colors.textMuted }]}>
               {item.status}
             </Text>
           )}
         </View>
-      </TouchableOpacity>
+      </View>
     );
   };
 
@@ -334,7 +398,6 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
           Homestay Document Capture
         </Text>
         <View style={styles.topBarActions}>
-          {/* Key Button to open Portal Credentials Modal */}
           <TouchableOpacity
             onPress={handleOpenCredentialsModal}
             style={[styles.iconButton, { backgroundColor: colors.surfaceSubtle }]}
@@ -342,7 +405,6 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
             <Text style={styles.iconButtonText}>🔑</Text>
           </TouchableOpacity>
 
-          {/* Theme Toggle Button */}
           <TouchableOpacity
             onPress={toggleTheme}
             style={[styles.iconButton, { backgroundColor: colors.surfaceSubtle, marginLeft: 8 }]}
@@ -418,7 +480,6 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
               Stored encrypted on device using Android Keystore.
             </Text>
 
-            {/* User ID Field */}
             <View style={styles.modalFieldGroup}>
               <Text style={[styles.modalLabel, { color: colors.textPrimary }]}>Portal User ID</Text>
               <TextInput
@@ -438,7 +499,6 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
               />
             </View>
 
-            {/* Password Field */}
             <View style={styles.modalFieldGroup}>
               <Text style={[styles.modalLabel, { color: colors.textPrimary }]}>Portal Password</Text>
               <TextInput
@@ -459,7 +519,6 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
               />
             </View>
 
-            {/* Save / Clear / Cancel Actions */}
             <View style={styles.modalActionsRow}>
               <TouchableOpacity
                 onPress={handleClearCredentials}
@@ -539,14 +598,14 @@ const styles = StyleSheet.create({
   submissionCard: {
     borderRadius: 12,
     borderWidth: 1,
-    padding: 16,
+    padding: 14,
     marginBottom: 12,
   },
   cardHeaderRow: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    marginBottom: 8,
+    marginBottom: 6,
   },
   referenceText: {
     fontSize: 16,
@@ -567,24 +626,51 @@ const styles = StyleSheet.create({
   cardMetaRow: {
     flexDirection: 'row',
     justifyContent: 'space-between',
-    marginBottom: 8,
+    marginBottom: 4,
   },
   metaLabel: {
     fontSize: 13,
   },
-  cardFooterRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: '#E2E8F0',
-    paddingTop: 8,
+  dateRow: {
+    marginBottom: 8,
   },
   dateText: {
     fontSize: 12,
   },
+  cardFooterActions: {
+    borderTopWidth: StyleSheet.hairlineWidth,
+    paddingTop: 8,
+  },
+  singleActionButton: {
+    paddingVertical: 4,
+  },
   actionPromptText: {
     fontSize: 13,
+    fontWeight: '600',
+  },
+  splitActionRow: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    alignItems: 'center',
+  },
+  centeredRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 4,
+  },
+  processingText: {
+    fontSize: 13,
+    fontWeight: '500',
+  },
+  smallButton: {
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: 'transparent',
+  },
+  smallButtonText: {
+    fontSize: 12,
     fontWeight: '600',
   },
   emptyContainer: {
