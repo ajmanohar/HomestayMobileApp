@@ -18,13 +18,13 @@ interface PortalScreenProps {
 }
 
 export const PortalScreen: React.FC<PortalScreenProps> = ({ submissionId, onClose }) => {
-  // Theme styling tokens (supports dynamic light / dark mode toggle)
+  // Dynamic color theme tokens
   const { colors } = useAppTheme();
 
-  // Reference handle to interact with the underlying WebView instance
+  // Reference handle to interact with the embedded WebView
   const webViewRef = useRef<WebView>(null);
 
-  // Screen state
+  // Screen execution state
   const [loadingWeb, setLoadingWeb] = useState<boolean>(true);
   const [currentUrl, setCurrentUrl] = useState<string>(
     'https://indianfrro.gov.in/frro/FormC/login.jsp'
@@ -80,8 +80,7 @@ export const PortalScreen: React.FC<PortalScreenProps> = ({ submissionId, onClos
   };
 
   /**
-   * Action: Injects stored portal credentials into login DOM inputs.
-   * Traverses main document, sub-frames, and iframes using prototype value setters.
+   * Injects stored portal credentials into login DOM inputs.
    */
   const handleAutofillLogin = async () => {
     try {
@@ -104,7 +103,6 @@ export const PortalScreen: React.FC<PortalScreenProps> = ({ submissionId, onClos
             var targetUserVal = ${sanitizedUser};
             var targetPassVal = ${sanitizedPass};
 
-            // Prototype setter helper to bypass portal event trapping
             function applyInputValue(inputEl, value) {
               if (!inputEl) return;
               inputEl.focus();
@@ -119,7 +117,6 @@ export const PortalScreen: React.FC<PortalScreenProps> = ({ submissionId, onClos
               inputEl.dispatchEvent(new Event('blur', { bubbles: true }));
             }
 
-            // Search both main document and accessible frames
             var searchContexts = [document];
             var iframes = document.querySelectorAll('iframe, frame');
             for (var i = 0; i < iframes.length; i++) {
@@ -137,7 +134,6 @@ export const PortalScreen: React.FC<PortalScreenProps> = ({ submissionId, onClos
             for (var c = 0; c < searchContexts.length; c++) {
               var ctx = searchContexts[c];
 
-              // Direct attribute selectors
               if (!userInput) {
                 userInput = ctx.querySelector('input[name="u_id"]') ||
                             ctx.querySelector('#u_id') ||
@@ -158,7 +154,6 @@ export const PortalScreen: React.FC<PortalScreenProps> = ({ submissionId, onClos
                 recordedInputs.push(inp.name ? ('name=' + inp.name) : (inp.id ? ('id=' + inp.id) : ('type=' + inp.type)));
               }
 
-              // Fallback: previous input before password
               if (passInput && !userInput) {
                 var allCtxInputs = Array.from(ctx.querySelectorAll('input'));
                 var passIdx = allCtxInputs.indexOf(passInput);
@@ -209,8 +204,7 @@ export const PortalScreen: React.FC<PortalScreenProps> = ({ submissionId, onClos
   };
 
   /**
-   * Action: Injects verified guest values into the Form-C arrival registration form DOM.
-   * Maps surname, given name, passport details, visa details, and travel origins/destinations.
+   * Injects verified guest values into the Form-C arrival registration form DOM.
    */
   const handleAutofillGuestData = () => {
     if (!guestData) {
@@ -226,7 +220,6 @@ export const PortalScreen: React.FC<PortalScreenProps> = ({ submissionId, onClos
           var data = ${payloadJson};
           var fieldsUpdated = 0;
 
-          // Helper to populate standard text inputs using prototype setter
           function setField(selectors, val) {
             if (!val) return;
             for (var i = 0; i < selectors.length; i++) {
@@ -248,7 +241,6 @@ export const PortalScreen: React.FC<PortalScreenProps> = ({ submissionId, onClos
             }
           }
 
-          // Helper to select matching option in standard dropdowns
           function setSelect(selectors, targetText) {
             if (!targetText) return;
             for (var i = 0; i < selectors.length; i++) {
@@ -269,7 +261,6 @@ export const PortalScreen: React.FC<PortalScreenProps> = ({ submissionId, onClos
             }
           }
 
-          // Helper to resolve field value supporting both camelCase and snake_case keys
           function getVal(keyCamel, keySnake) {
             var val = data[keyCamel] || data[keySnake];
             if (val && typeof val === 'object' && 'value' in val) {
@@ -278,19 +269,12 @@ export const PortalScreen: React.FC<PortalScreenProps> = ({ submissionId, onClos
             return val || '';
           }
 
-          // 1. Foreigner Name fields (Surname First / Given Names)
           setField(['input[name="sur_name"]', '#sur_name', 'input[name="surname"]'], getVal('surname', 'surname'));
           setField(['input[name="given_name"]', '#given_name', 'input[name="first_name"]'], getVal('givenName', 'given_names') || getVal('givenName', 'given_name'));
-
-          // 2. Passport & Identity
           setField(['input[name="pass_num"]', '#pass_num', 'input[name="passport_no"]'], getVal('passportNumber', 'passport_number'));
           setSelect(['select[name="nationality"]', '#nationality', 'select[name="spl_category"]'], getVal('nationality', 'nationality'));
           setField(['input[name="dob"]', '#dob', 'input[name="date_of_birth"]'], getVal('dateOfBirth', 'date_of_birth'));
-
-          // 3. Visa / OCI Details
           setField(['input[name="visa_num"]', '#visa_num', 'input[name="visa_number"]'], getVal('visaNumber', 'visa_number'));
-
-          // 4. Arrival & Departure Details (Form-C Rule 14)
           setField(['input[name="arri_from"]', '#arri_from', 'input[name="arrived_from"]'], getVal('arrivedFrom', 'arrived_from'));
           setField(['input[name="proc_to"]', '#proc_to', 'input[name="proceeding_to"]'], getVal('proceedingTo', 'proceeding_to'));
           setField(['input[name="purpose_of_visit"]', '#purpose_of_visit', 'input[name="purpose"]'], getVal('purposeOfVisit', 'purpose_of_visit') || 'Tourism');
@@ -353,21 +337,18 @@ export const PortalScreen: React.FC<PortalScreenProps> = ({ submissionId, onClos
           sharedCookiesEnabled={true}
           thirdPartyCookiesEnabled={true}
           mixedContentMode="always"
-          allowsInlineMediaPlayback={true}
+          setSupportMultipleWindows={false}
+          javaScriptCanOpenWindowsAutomatically={false}
+          cacheEnabled={true}
           originWhitelist={['*']}
-          // Modern Chrome Mobile User-Agent to ensure standard rendering
           userAgent="Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
           onMessage={handleWebViewMessage}
           onLoadStart={() => setLoadingWeb(true)}
           onLoadEnd={() => setLoadingWeb(false)}
           onError={(syntheticEvent) => {
             const { nativeEvent } = syntheticEvent;
-            console.warn('[PortalScreen] WebView load error:', nativeEvent);
+            console.warn('[PortalScreen] WebView error handled internally:', nativeEvent);
             setLoadingWeb(false);
-          }}
-          onHttpError={(syntheticEvent) => {
-            const { nativeEvent } = syntheticEvent;
-            console.warn('[PortalScreen] HTTP Error:', nativeEvent.statusCode);
           }}
           onNavigationStateChange={(navState) => {
             setCurrentUrl(navState.url);
@@ -389,7 +370,6 @@ export const PortalScreen: React.FC<PortalScreenProps> = ({ submissionId, onClos
           { backgroundColor: colors.surface, borderTopColor: colors.border },
         ]}
       >
-        {/* Assisted Login Button */}
         <TouchableOpacity
           onPress={handleAutofillLogin}
           style={[styles.actionButton, { backgroundColor: colors.accent }]}
@@ -397,7 +377,6 @@ export const PortalScreen: React.FC<PortalScreenProps> = ({ submissionId, onClos
           <Text style={styles.actionButtonText}>🔑 Autofill Login</Text>
         </TouchableOpacity>
 
-        {/* Populate Guest Data Button */}
         <TouchableOpacity
           onPress={handleAutofillGuestData}
           style={[styles.actionButton, { backgroundColor: colors.primaryBrand }]}
@@ -462,7 +441,7 @@ const styles = StyleSheet.create({
     bottom: 0,
     justifyContent: 'center',
     alignItems: 'center',
-    backgroundColor: 'rgba(255, 255, 255, 0.4)',
+    backgroundColor: 'rgba(255, 255, 255, 0.3)',
   },
   bottomBar: {
     height: 64,
