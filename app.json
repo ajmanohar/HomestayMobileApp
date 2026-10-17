@@ -25,6 +25,12 @@
         "READ_EXTERNAL_STORAGE",
         "WRITE_EXTERNAL_STORAGE"
       ]
-    }
+    },
+    "extra": {
+      "eas": {
+        "projectId": "1fc410ac-80ed-4a51-83af-f0524d4fed23"
+      }
+    },
+    "owner": "asymptote-team"
   }
 }
