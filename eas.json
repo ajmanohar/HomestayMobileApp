@@ -1,31 +1,26 @@
 {
-  "$comment": "EAS build configuration file for HomestayMobileApp. Top-level keys configure build profiles and CLI version requirements.",
   "cli": {
     "version": ">= 12.0.0",
     "appVersionSource": "remote"
   },
   "build": {
     "development": {
-      "$comment": "Development build profile: builds an Expo Dev Client runtime binary rather than a standalone production APK.",
       "developmentClient": true,
       "distribution": "internal"
     },
     "preview": {
-      "$comment": "Preview build profile: builds a standalone, installable Android APK file (.apk) directly for sideloading and operator testing without requiring Google Play Store submission.",
       "distribution": "internal",
       "android": {
         "buildType": "apk"
       }
     },
     "production": {
-      "$comment": "Production build profile: standard Android App Bundle (.aab) generation ready for Google Play Store upload.",
       "android": {
         "buildType": "app-bundle"
       }
     }
   },
   "submit": {
-    "$comment": "Submit profiles define configurations for automatically uploading binaries to app stores.",
     "production": {}
   }
 }
