@@ -34,16 +34,28 @@ interface DashboardScreenProps {
   onOpenPortal: (submissionId: string) => void;
 }
 
+/**
+ * Aggregated submission structure including loaded guest document child records.
+ */
+interface SubmissionWithGuests extends SubmissionRecord {
+  guests: GuestDocumentRecord[];
+}
+
+/**
+ * Stage status evaluation helper for an individual document.
+ */
+type StageStatus = 'PENDING' | 'PROCESSING' | 'COMPLETED' | 'NOT_ATTACHED';
+
 export const DashboardScreen: React.FC<DashboardScreenProps> = ({
   onStartNewCapture,
   onOpenReview,
   onOpenPortal,
 }) => {
-  // Theme styling tokens (supports dark / light mode toggle)
+  // Theme styling tokens (supports dynamic light / dark mode toggle)
   const { colors, isDark, toggleTheme } = useAppTheme();
 
   // Screen queue and processing states
-  const [submissions, setSubmissions] = useState<SubmissionRecord[]>([]);
+  const [submissions, setSubmissions] = useState<SubmissionWithGuests[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [refreshing, setRefreshing] = useState<boolean>(false);
   const [retryingId, setRetryingId] = useState<string | null>(null);
@@ -55,14 +67,44 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
   const [isSavingCreds, setIsSavingCreds] = useState<boolean>(false);
 
   /**
-   * Queries local SQLite database to load recent guest submissions.
+   * Queries local SQLite database to load recent guest submissions
+   * and attaches all guest document child rows per submission.
+   * Defensively guards against undefined return values from SQLite queries.
    */
   const loadSubmissions = useCallback(async () => {
     try {
-      const records = await getAllSubmissions();
-      setSubmissions(records);
+      const rawRecords = await getAllSubmissions();
+      // Guard against undefined or null SQLite return values
+      const records = Array.isArray(rawRecords) ? rawRecords : [];
+
+      const db = await openDatabase();
+
+      // Query guest documents for each submission with defensive array checks
+      const loadedSubmissions: SubmissionWithGuests[] = await Promise.all(
+        records.map(async (sub) => {
+          try {
+            const guestDocs = await db.getAllAsync<GuestDocumentRecord>(
+              'SELECT * FROM guest_documents WHERE submission_id = ? ORDER BY guest_index ASC;',
+              [sub.id]
+            );
+            return {
+              ...sub,
+              guests: Array.isArray(guestDocs) ? guestDocs : [],
+            };
+          } catch (err) {
+            console.warn(`[Dashboard] Failed loading guests for submission ${sub.id}:`, err);
+            return {
+              ...sub,
+              guests: [],
+            };
+          }
+        })
+      );
+
+      setSubmissions(loadedSubmissions);
     } catch (error) {
       console.warn('[Dashboard] Error querying submissions from SQLite:', error);
+      setSubmissions([]);
     } finally {
       setLoading(false);
     }
@@ -137,12 +179,12 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
   };
 
   /**
-   * Resubmits an existing submission for processing without re-capturing images.
-   * Can be invoked from UPLOAD_PENDING, PENDING_REVIEW, or REVIEWED states.
+   * Resubmits an entire submission for background AI extraction without re-capturing images.
+   * Re-submission occurs strictly at the parent SUBMISSION level.
    *
    * @param item - The submission record to re-extract
    */
-  const handleTriggerReExtract = async (item: SubmissionRecord) => {
+  const handleTriggerReExtract = async (item: SubmissionWithGuests) => {
     if (!item || !item.id) {
       Alert.alert('Error', 'Invalid submission record ID.');
       return;
@@ -150,23 +192,19 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
 
     try {
       setRetryingId(item.id);
-      console.log(`[Dashboard] Starting re-extraction for submission ID: ${item.id}`);
+      console.log(`[Dashboard] Starting submission-level re-extraction for ID: ${item.id}`);
 
-      const db = await openDatabase();
       const safeSubmissionId = String(item.id).trim();
+      const guestList = Array.isArray(item.guests) ? item.guests : [];
 
-      // Retrieve locally stored image paths for this guest record
-      const docs = await db.getAllAsync<GuestDocumentRecord>(
-        'SELECT * FROM guest_documents WHERE submission_id = ? LIMIT 1;',
-        [safeSubmissionId]
-      );
-
-      if (!docs || docs.length === 0) {
-        Alert.alert('Error', 'No document images found on device for this submission.');
+      // Retrieve locally stored image paths for guest records
+      if (guestList.length === 0) {
+        Alert.alert('Error', 'No guest document records found for this submission.');
         return;
       }
 
-      const guestDoc = docs[0];
+      // Extract using primary guest document artifacts
+      const guestDoc = guestList[0];
 
       // Dispatch existing captured artifacts directly to backend FastAPI endpoint
       const response = await submitGuestDocuments(
@@ -190,7 +228,7 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
 
       Alert.alert(
         'Processing Initiated',
-        `Job dispatched to server with ID: ${response.job_id.slice(0, 8)}... Data will refresh automatically.`
+        `Job dispatched to server with ID: ${response.job_id.slice(0, 8)}... Stage labels will update automatically.`
       );
     } catch (error: any) {
       console.error(`[Dashboard] Re-extraction request failed for ${item.id}:`, error);
@@ -209,7 +247,7 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
   }, [loadSubmissions]);
 
   /**
-   * Semantic badge visual configuration.
+   * Overall submission status badge visual configuration.
    */
   const getStatusBadgeStyle = (status: SubmissionStatus) => {
     switch (status) {
@@ -224,6 +262,46 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
       default:
         return { backgroundColor: colors.textMuted, label: status };
     }
+  };
+
+  /**
+   * Computes the granular execution status of each individual service pipeline for a guest.
+   */
+  const evaluateServiceStage = (
+    submissionStatus: SubmissionStatus,
+    extractedData: any,
+    documentPath: string | null | undefined,
+    fieldKeys: string[]
+  ): StageStatus => {
+    if (!documentPath) {
+      return 'NOT_ATTACHED';
+    }
+
+    // Check if any of the target fields are already extracted and present
+    if (extractedData && typeof extractedData === 'object') {
+      const hasExtractedField = fieldKeys.some((k) => {
+        const val = extractedData[k];
+        if (!val) return false;
+        if (typeof val === 'object' && 'value' in val) {
+          return val.value !== null && val.value !== undefined && String(val.value).trim().length > 0;
+        }
+        return String(val).trim().length > 0;
+      });
+
+      if (hasExtractedField) {
+        return 'COMPLETED';
+      }
+    }
+
+    if (submissionStatus === 'PROCESSING') {
+      return 'PROCESSING';
+    }
+
+    if (submissionStatus === 'PENDING_REVIEW' || submissionStatus === 'REVIEWED') {
+      return 'COMPLETED';
+    }
+
+    return 'PENDING';
   };
 
   /**
@@ -244,11 +322,11 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
   };
 
   /**
-   * Main card body press router:
+   * Card body press router:
    * - If REVIEWED or PENDING_REVIEW: opens review verification editor.
    * - If UPLOAD_PENDING: triggers submission upload.
    */
-  const handleCardPress = (item: SubmissionRecord) => {
+  const handleCardPress = (item: SubmissionWithGuests) => {
     if (item.status === 'REVIEWED' || item.status === 'PENDING_REVIEW') {
       onOpenReview(item.id);
     } else if (item.status === 'UPLOAD_PENDING') {
@@ -257,15 +335,48 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
   };
 
   /**
-   * Renders each individual submission card with explicit actionable options.
+   * Helper component rendering an individual stage badge pill.
    */
-  const renderSubmissionItem = ({ item }: { item: SubmissionRecord }) => {
+  const renderStagePill = (label: string, stageStatus: StageStatus) => {
+    let pillBg = colors.surfaceSubtle;
+    let textColor = colors.textMuted;
+    let statusText = 'Pending';
+
+    if (stageStatus === 'COMPLETED') {
+      pillBg = colors.statusReady; // Turns Emerald Green when complete
+      textColor = '#FFFFFF';
+      statusText = 'Done ✓';
+    } else if (stageStatus === 'PROCESSING') {
+      pillBg = colors.statusProcess; // Blue when actively processing
+      textColor = '#FFFFFF';
+      statusText = 'Running ⏳';
+    } else if (stageStatus === 'NOT_ATTACHED') {
+      pillBg = colors.surfaceSubtle;
+      textColor = colors.textMuted;
+      statusText = 'None';
+    }
+
+    return (
+      <View style={[styles.stagePill, { backgroundColor: pillBg, borderColor: colors.border }]}>
+        <Text style={[styles.stagePillLabel, { color: textColor }]}>
+          {label}: <Text style={{ fontWeight: '700' }}>{statusText}</Text>
+        </Text>
+      </View>
+    );
+  };
+
+  /**
+   * Renders each individual submission card with per-guest granular status strips.
+   */
+  const renderSubmissionItem = ({ item }: { item: SubmissionWithGuests }) => {
     const badge = getStatusBadgeStyle(item.status);
     const isReadyForReview = item.status === 'PENDING_REVIEW';
     const isReviewed = item.status === 'REVIEWED';
     const isUploadPending = item.status === 'UPLOAD_PENDING';
     const isProcessing = item.status === 'PROCESSING';
     const isThisCardActive = retryingId === item.id;
+    // Defensive check ensuring guests is always an array
+    const guestList = Array.isArray(item.guests) ? item.guests : [];
 
     return (
       <View
@@ -307,17 +418,71 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
           </View>
         </TouchableOpacity>
 
-        {/* Action Button Strip */}
+        {/* Granular Per-Guest Service Pipeline Badges */}
+        <View style={[styles.guestListContainer, { borderTopColor: colors.border }]}>
+          {guestList.map((guest, idx) => {
+            let extractedData: any = null;
+            if (guest.extracted_data_json) {
+              try {
+                extractedData = JSON.parse(guest.extracted_data_json);
+              } catch {
+                extractedData = null;
+              }
+            }
+
+            // Derive stage status for each service pipeline
+            const passportStatus = evaluateServiceStage(
+              item.status,
+              extractedData,
+              guest.passport_bio_path,
+              ['surname', 'given_names', 'passport_number', 'nationality']
+            );
+            const visaStatus = evaluateServiceStage(
+              item.status,
+              extractedData,
+              guest.visa_stamp_path,
+              ['visa_number', 'visa_type', 'visa_issue_date', 'visa_expiry_date']
+            );
+            const stampStatus = evaluateServiceStage(
+              item.status,
+              extractedData,
+              guest.entry_stamp_path,
+              ['arrival_date_india', 'arrival_port_india']
+            );
+            const formCStatus = evaluateServiceStage(
+              item.status,
+              extractedData,
+              guest.form_c_path,
+              ['permanent_address', 'contact_email', 'contact_phone', 'arrived_from', 'proceeding_to']
+            );
+
+            return (
+              <View key={guest.id || `guest_${idx}`} style={styles.guestStatusSection}>
+                <Text style={[styles.guestHeaderTitle, { color: colors.textPrimary }]}>
+                  👤 Guest {idx + 1} Pipeline Services:
+                </Text>
+                <View style={styles.stagePillsGrid}>
+                  {renderStagePill('1. Passport / MRZ', passportStatus)}
+                  {renderStagePill('2. Visa / OCI', visaStatus)}
+                  {renderStagePill('3. Entry Stamp', stampStatus)}
+                  {renderStagePill('4. Form-C Report', formCStatus)}
+                </View>
+              </View>
+            );
+          })}
+        </View>
+
+        {/* Submission-Level Action Footer */}
         <View style={[styles.cardFooterActions, { borderTopColor: colors.border }]}>
           {isThisCardActive ? (
             <View style={styles.centeredRow}>
               <ActivityIndicator size="small" color={colors.accent} />
-              <Text style={[styles.processingText, { color: colors.accent }]}> Submitting...</Text>
+              <Text style={[styles.processingText, { color: colors.accent }]}> Submitting bundle...</Text>
             </View>
           ) : isUploadPending ? (
             <TouchableOpacity onPress={() => handleTriggerReExtract(item)} style={styles.singleActionButton}>
               <Text style={[styles.actionPromptText, { color: colors.accent }]}>
-                Tap to Send for Extraction ⟳
+                Tap to Send Submission for Extraction ⟳
               </Text>
             </TouchableOpacity>
           ) : isProcessing ? (
@@ -329,12 +494,12 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
             </View>
           ) : isReadyForReview ? (
             <View style={styles.splitActionRow}>
-              {/* Secondary button: Re-run extraction using existing pictures */}
+              {/* Submission-level Re-run */}
               <TouchableOpacity
                 onPress={() => handleTriggerReExtract(item)}
                 style={[styles.smallButton, { backgroundColor: colors.surfaceSubtle, borderColor: colors.border }]}
               >
-                <Text style={[styles.smallButtonText, { color: colors.textMuted }]}>⟳ Re-run</Text>
+                <Text style={[styles.smallButtonText, { color: colors.textMuted }]}>⟳ Re-run All</Text>
               </TouchableOpacity>
 
               {/* Primary button: Open review editor */}
@@ -349,12 +514,12 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
             </View>
           ) : isReviewed ? (
             <View style={styles.splitActionRow}>
-              {/* Re-run extraction button */}
+              {/* Submission-level Re-run */}
               <TouchableOpacity
                 onPress={() => handleTriggerReExtract(item)}
                 style={[styles.smallButton, { backgroundColor: colors.surfaceSubtle, borderColor: colors.border }]}
               >
-                <Text style={[styles.smallButtonText, { color: colors.textMuted }]}>⟳ Re-run</Text>
+                <Text style={[styles.smallButtonText, { color: colors.textMuted }]}>⟳ Re-run All</Text>
               </TouchableOpacity>
 
               {/* Edit button */}
@@ -636,6 +801,33 @@ const styles = StyleSheet.create({
   },
   dateText: {
     fontSize: 12,
+  },
+  guestListContainer: {
+    borderTopWidth: StyleSheet.hairlineWidth,
+    paddingTop: 8,
+    marginBottom: 8,
+  },
+  guestStatusSection: {
+    marginBottom: 6,
+  },
+  guestHeaderTitle: {
+    fontSize: 12,
+    fontWeight: '700',
+    marginBottom: 6,
+  },
+  stagePillsGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 6,
+  },
+  stagePill: {
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 6,
+    borderWidth: 1,
+  },
+  stagePillLabel: {
+    fontSize: 11,
   },
   cardFooterActions: {
     borderTopWidth: StyleSheet.hairlineWidth,
