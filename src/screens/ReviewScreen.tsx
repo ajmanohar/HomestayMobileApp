@@ -86,16 +86,43 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
           if (doc.extracted_data_json) {
             try {
               const parsed = JSON.parse(doc.extracted_data_json);
+
+              // Helper function to safely extract string values whether flat or wrapped in FieldResult { value, confidence }
+              const extractVal = (field: any): string => {
+                if (field === null || field === undefined) {
+                  return '';
+                }
+                // If backend wrapped the field in a FieldResult object { value: "...", confidence: 0.8 }
+                if (typeof field === 'object' && 'value' in field) {
+                  return field.value !== null && field.value !== undefined ? String(field.value) : '';
+                }
+                // If backend sent a raw primitive (string, number)
+                return String(field);
+              };
+
               setFormData({
-                surname: parsed.surname || parsed.last_name || '',
-                givenName: parsed.given_name || parsed.first_name || '',
-                passportNumber: parsed.passport_number || parsed.passport_no || '',
-                nationality: parsed.nationality || '',
-                dateOfBirth: parsed.date_of_birth || parsed.dob || '',
-                visaNumber: parsed.visa_number || parsed.visa_no || '',
-                arrivedFrom: parsed.arrived_from || '',
-                proceedingTo: parsed.proceeding_to || '',
-                purposeOfVisit: parsed.purpose_of_visit || 'Tourism',
+                // Surname extraction supporting both standard and fallback keys
+                surname: extractVal(parsed.surname || parsed.last_name),
+
+                // Given names extraction supporting plural (backend standard) and singular
+                givenName: extractVal(parsed.given_names || parsed.given_name || parsed.first_name),
+
+                // Passport number extraction supporting standard key variations
+                passportNumber: extractVal(parsed.passport_number || parsed.passport_no || parsed.pass_num),
+
+                // Nationality extraction
+                nationality: extractVal(parsed.nationality),
+
+                // Date of birth extraction supporting standard key variations
+                dateOfBirth: extractVal(parsed.date_of_birth || parsed.dob),
+
+                // Visa number extraction supporting standard key variations
+                visaNumber: extractVal(parsed.visa_number || parsed.visa_no || parsed.visa_num),
+
+                // Arrival slip fields (Form-C Rule 14)
+                arrivedFrom: extractVal(parsed.arrived_from || parsed.arri_from),
+                proceedingTo: extractVal(parsed.proceeding_to || parsed.proc_to),
+                purposeOfVisit: extractVal(parsed.purpose_of_visit || 'Tourism'),
               });
             } catch (err) {
               console.warn('[ReviewScreen] Could not parse extracted JSON payload:', err);
