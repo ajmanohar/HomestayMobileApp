@@ -20,17 +20,18 @@ export interface JobSubmitResponse {
 export interface JobStatusResponse {
   job_id: string;
   status: 'QUEUED' | 'PROCESSING' | 'COMPLETED' | 'FAILED';
-  extracted_data?: Record<string, any>;
   result?: Record<string, any>;
   data?: Record<string, any>;
+  extracted_data?: Record<string, any>;
+  error_message?: string;
   error?: string;
 }
 
 /**
- * Normalizes file URI to ensure valid file:// prefix for native file system handlers.
+ * Helper to ensure a URI string has a valid file:// prefix for native Android file access.
  *
  * @param uri - Local file URI or path
- * @returns Fully qualified file:// URI string
+ * @returns Standardized file:// URI
  */
 const ensureFileUri = (uri: string): string => {
   if (uri.startsWith('file://')) {
@@ -40,15 +41,51 @@ const ensureFileUri = (uri: string): string => {
 };
 
 /**
- * Submits the captured passport document to the backend extraction pipeline.
- * Uses Expo FileSystem native uploadAsync to bypass React Native's Android
- * OkHttp FormDataPart bridge restrictions.
+ * Uploads an individual supplementary document to an existing job.
+ * Uses native uploadAsync to bypass React Native Android OkHttp FormData issues.
+ *
+ * @param jobId - UUID of the active job
+ * @param docType - Target attachment type ('visa_page', 'entry_stamp', or 'welcome_form')
+ * @param filePath - Local filesystem URI of the image
+ */
+export const attachDocumentToJob = async (
+  jobId: string,
+  docType: 'visa_page' | 'entry_stamp' | 'welcome_form',
+  filePath: string
+): Promise<void> => {
+  const attachUrl = `${BASE_URL}/jobs/${jobId}/attach/${docType}`;
+  const normalizedUri = ensureFileUri(filePath);
+
+  console.log(`[ApiService] Attaching ${docType} to job ${jobId}...`);
+
+  const uploadResult = await FileSystem.uploadAsync(attachUrl, normalizedUri, {
+    httpMethod: 'POST',
+    uploadType: FileSystem.FileSystemUploadType.MULTIPART,
+    fieldName: 'file',
+    headers: {
+      Accept: 'application/json',
+    },
+  });
+
+  if (uploadResult.status < 200 || uploadResult.status >= 300) {
+    console.warn(
+      `[ApiService] Failed attaching ${docType} (HTTP ${uploadResult.status}): ${uploadResult.body}`
+    );
+  } else {
+    console.log(`[ApiService] Successfully attached ${docType} to job ${jobId}.`);
+  }
+};
+
+/**
+ * Submits all captured documents into the backend extraction pipeline.
+ * Submits the mandatory passport bio page first, then sequentially attaches
+ * the visa page, entry stamp, and handwritten Form-C arrival report.
  *
  * @param passportBioPath - Local file URI for passport bio page (mandatory)
  * @param visaPath - Local file URI for visa or OCI card (optional)
- * @param entryStampPath - Local file URI for entry immigration stamp (optional)
- * @param formCPath - Local file URI for handwritten Form-C arrival report (optional)
- * @param reference - Optional booking reference or guest identifier
+ * @param entryStampPath - Local file URI for immigration arrival stamp (optional)
+ * @param formCPath - Local file URI for physical Form-C arrival report (optional)
+ * @param reference - Optional guest reference identifier
  * @returns Parsed JobSubmitResponse containing the assigned job_id
  */
 export const submitGuestDocuments = async (
@@ -58,7 +95,7 @@ export const submitGuestDocuments = async (
   formCPath?: string,
   reference?: string
 ): Promise<JobSubmitResponse> => {
-  const uploadUrl = `${BASE_URL}/jobs/submit`;
+  const submitUrl = `${BASE_URL}/jobs/submit`;
 
   if (!passportBioPath) {
     throw new Error('Passport bio page image is required for document extraction.');
@@ -66,47 +103,62 @@ export const submitGuestDocuments = async (
 
   const normalizedBioUri = ensureFileUri(passportBioPath);
 
-  // Prepare metadata parameters passed alongside the binary
-  const parameters: Record<string, string> = {
-    reference: reference ?? '',
-  };
-
-  if (visaPath) {
-    parameters['has_visa'] = 'true';
-  }
-  if (entryStampPath) {
-    parameters['has_entry_stamp'] = 'true';
-  }
-  if (formCPath) {
-    parameters['has_form_c'] = 'true';
-  }
-
-  // Execute native background multipart upload via Expo FileSystem legacy engine
-  const uploadResult = await FileSystem.uploadAsync(uploadUrl, normalizedBioUri, {
+  // 1. Submit primary passport bio page to create job record and receive job_id
+  console.log('[ApiService] Submitting primary passport bio page to initialize job...');
+  const submitResult = await FileSystem.uploadAsync(submitUrl, normalizedBioUri, {
     httpMethod: 'POST',
     uploadType: FileSystem.FileSystemUploadType.MULTIPART,
     fieldName: 'passport_bio',
-    parameters: parameters,
     headers: {
       Accept: 'application/json',
     },
   });
 
-  if (uploadResult.status < 200 || uploadResult.status >= 300) {
+  if (submitResult.status < 200 || submitResult.status >= 300) {
     throw new Error(
-      `Job submission failed with status ${uploadResult.status}: ${uploadResult.body}`
+      `Job submission failed with status ${submitResult.status}: ${submitResult.body}`
     );
   }
 
-  const parsedResponse: JobSubmitResponse = JSON.parse(uploadResult.body);
-  return parsedResponse;
+  const parsedSubmit: JobSubmitResponse = JSON.parse(submitResult.body);
+  const jobId = parsedSubmit.job_id;
+  console.log(`[ApiService] Job initialized with ID: ${jobId}`);
+
+  // 2. Attach Visa / OCI image if available
+  if (visaPath && typeof visaPath === 'string' && visaPath.trim().length > 0) {
+    try {
+      await attachDocumentToJob(jobId, 'visa_page', visaPath);
+    } catch (err) {
+      console.warn('[ApiService] Error attaching visa page:', err);
+    }
+  }
+
+  // 3. Attach Entry Stamp image if available
+  if (entryStampPath && typeof entryStampPath === 'string' && entryStampPath.trim().length > 0) {
+    try {
+      await attachDocumentToJob(jobId, 'entry_stamp', entryStampPath);
+    } catch (err) {
+      console.warn('[ApiService] Error attaching entry stamp:', err);
+    }
+  }
+
+  // 4. Attach Handwritten Form-C Arrival Report if available
+  if (formCPath && typeof formCPath === 'string' && formCPath.trim().length > 0) {
+    try {
+      await attachDocumentToJob(jobId, 'welcome_form', formCPath);
+    } catch (err) {
+      console.warn('[ApiService] Error attaching welcome form:', err);
+    }
+  }
+
+  return parsedSubmit;
 };
 
 /**
- * Polls the backend API for the current extraction status of a queued or processing job.
+ * Polls the backend API for the current extraction status of a job.
  *
  * @param jobId - UUID returned by submitGuestDocuments
- * @returns JobStatusResponse containing status flag and optional extracted OCR data
+ * @returns JobStatusResponse containing status and extracted data
  */
 export const pollJobStatus = async (jobId: string): Promise<JobStatusResponse> => {
   const statusUrl = `${BASE_URL}/jobs/${jobId}`;
