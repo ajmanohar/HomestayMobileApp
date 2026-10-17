@@ -26,7 +26,7 @@ export const pollJobUntilComplete = async (
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       // 1. Pause execution for the poll interval
-      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      await new Promise((resolve) => setTimeout(() => resolve(undefined), delayMs));
 
       console.log(`[SyncManager] Polling check ${attempt}/${maxAttempts} for job: ${jobId}`);
       const statusResponse = await pollJobStatus(jobId);
