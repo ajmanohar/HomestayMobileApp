@@ -6,11 +6,12 @@ import { initDatabase } from './src/db/database';
 import { DashboardScreen } from './src/screens/DashboardScreen';
 import { CaptureScreen } from './src/screens/CaptureScreen';
 import { ReviewScreen } from './src/screens/ReviewScreen';
+import { PortalScreen } from './src/screens/PortalScreen';
 
 /**
  * Screen identifier enum for local client state navigation.
  */
-type ActiveScreen = 'DASHBOARD' | 'CAPTURE' | 'REVIEW';
+type ActiveScreen = 'DASHBOARD' | 'CAPTURE' | 'REVIEW' | 'PORTAL';
 
 /**
  * Main application container that accesses the active ThemeContext.
@@ -20,7 +21,7 @@ const AppContent: React.FC = () => {
 
   // Navigation state
   const [currentScreen, setCurrentScreen] = useState<ActiveScreen>('DASHBOARD');
-  const [reviewSubmissionId, setReviewSubmissionId] = useState<string | null>(null);
+  const [activeSubmissionId, setActiveSubmissionId] = useState<string | null>(null);
   const [isDbReady, setIsDbReady] = useState<boolean>(false);
 
   // Initialize SQLite database on boot
@@ -58,8 +59,12 @@ const AppContent: React.FC = () => {
         <DashboardScreen
           onStartNewCapture={() => setCurrentScreen('CAPTURE')}
           onOpenReview={(id: string) => {
-            setReviewSubmissionId(id);
+            setActiveSubmissionId(id);
             setCurrentScreen('REVIEW');
+          }}
+          onOpenPortal={(id: string) => {
+            setActiveSubmissionId(id);
+            setCurrentScreen('PORTAL');
           }}
         />
       )}
@@ -71,15 +76,25 @@ const AppContent: React.FC = () => {
         />
       )}
 
-      {currentScreen === 'REVIEW' && reviewSubmissionId && (
+      {currentScreen === 'REVIEW' && activeSubmissionId && (
         <ReviewScreen
-          submissionId={reviewSubmissionId}
+          submissionId={activeSubmissionId}
           onFinishReview={() => {
-            setReviewSubmissionId(null);
+            setActiveSubmissionId(null);
             setCurrentScreen('DASHBOARD');
           }}
           onCancel={() => {
-            setReviewSubmissionId(null);
+            setActiveSubmissionId(null);
+            setCurrentScreen('DASHBOARD');
+          }}
+        />
+      )}
+
+      {currentScreen === 'PORTAL' && activeSubmissionId && (
+        <PortalScreen
+          submissionId={activeSubmissionId}
+          onClose={() => {
+            setActiveSubmissionId(null);
             setCurrentScreen('DASHBOARD');
           }}
         />
