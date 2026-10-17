@@ -1,3 +1,10 @@
+/**
+ * Background synchronization manager for HomestayMobileApp.
+ * Handles uploading local document captures to the backend API,
+ * polling asynchronous Form-C batch jobs, and persisting progressive
+ * intermediate extraction results to local SQLite storage in real time.
+ */
+
 import {
   openDatabase,
   updateSubmissionStatus,
@@ -7,8 +14,33 @@ import {
 import { submitGuestDocuments, pollJobStatus } from './apiService';
 
 /**
+ * Helper to safely extract the extraction payload dictionary
+ * across various possible backend response wrappers.
+ *
+ * @param statusResponse - Raw JSON payload returned from the backend status endpoint.
+ * @returns Parsed extraction dictionary or null.
+ */
+const extractDataPayload = (statusResponse: any): any => {
+  if (!statusResponse || typeof statusResponse !== 'object') {
+    return null;
+  }
+  const payload =
+    statusResponse.extracted_data ||
+    statusResponse.result ||
+    statusResponse.data;
+
+  // Return payload if present and non-empty
+  if (payload && typeof payload === 'object' && Object.keys(payload).length > 0) {
+    return payload;
+  }
+  return null;
+};
+
+/**
  * Polls an active extraction job with retry attempts until COMPLETED, FAILED, or timeout.
  * Runs in detached background execution so the user interface remains responsive.
+ * Progressively persists partial extraction snapshots into SQLite while still PROCESSING,
+ * allowing the Dashboard stage badges (Passport, Visa, Stamp, Form-C) to turn green in real time.
  *
  * @param submissionId - Local SQLite primary key for the submission
  * @param jobId - UUID assigned by the backend extraction pipeline
@@ -33,22 +65,41 @@ export const pollJobUntilComplete = async (
 
       const normalizedStatus = String(statusResponse.status || '').toUpperCase();
 
+      // -----------------------------------------------------------------------
+      // Progressive Intermediate Snapshot Persistence:
+      // Check if backend returned partial extraction fields while still PROCESSING.
+      // Write them to SQLite so Dashboard badges update to green progressively.
+      // -----------------------------------------------------------------------
+      const currentPayload = extractDataPayload(statusResponse);
+      if (currentPayload) {
+        try {
+          const db = await openDatabase();
+          const jsonString = JSON.stringify(currentPayload);
+
+          // Persist current extraction state into SQLite guest_documents table
+          await db.runAsync(
+            `UPDATE guest_documents SET extracted_data_json = ? WHERE submission_id = ?;`,
+            [jsonString, submissionId]
+          );
+          console.log(
+            `[SyncManager] Persisted progressive snapshot (${Object.keys(currentPayload).length} keys) for submission: ${submissionId}`
+          );
+        } catch (dbErr) {
+          console.warn(`[SyncManager] Failed writing progressive snapshot to SQLite:`, dbErr);
+        }
+      }
+
       // 2. Handle successful completion
       if (normalizedStatus === 'COMPLETED') {
         console.log(`[SyncManager] Job ${jobId} finished with status COMPLETED.`);
 
-        // Locate data payload across possible backend response wrapper schemas
-        const dataPayload =
-          statusResponse.extracted_data ||
-          statusResponse.result ||
-          statusResponse.data ||
-          statusResponse;
-
-        const jsonString = JSON.stringify(dataPayload);
+        // Final payload extraction
+        const finalPayload = currentPayload || statusResponse;
+        const jsonString = JSON.stringify(finalPayload);
 
         const db = await openDatabase();
 
-        // Persist extracted JSON into SQLite guest_documents table
+        // Persist final completed JSON into SQLite guest_documents table
         await db.runAsync(
           `UPDATE guest_documents SET extracted_data_json = ? WHERE submission_id = ?;`,
           [jsonString, submissionId]
@@ -63,7 +114,8 @@ export const pollJobUntilComplete = async (
       // 3. Handle processing failure
       if (normalizedStatus === 'FAILED') {
         console.warn(`[SyncManager] Server flagged extraction failure for job: ${jobId}`);
-        // Keep in PROCESSING or alert via local note so operator can inspect
+        // Reset or flag submission so operator can inspect or retry
+        await updateSubmissionStatus(submissionId, 'UPLOAD_PENDING');
         return;
       }
     } catch (error) {
@@ -133,6 +185,7 @@ export const syncPendingUploads = async (): Promise<void> => {
 /**
  * Queries the backend API for all submissions currently in 'PROCESSING' state.
  * Used during manual pull-to-refresh on the Dashboard.
+ * Also persists progressive intermediate results if available.
  */
 export const pollActiveJobs = async (): Promise<void> => {
   const db = await openDatabase();
@@ -152,15 +205,21 @@ export const pollActiveJobs = async (): Promise<void> => {
       const result = await pollJobStatus(submission.job_id);
 
       const normalizedStatus = String(result.status || '').toUpperCase();
+      const currentPayload = extractDataPayload(result);
 
+      // Persist partial intermediate fields if present
+      if (currentPayload) {
+        const jsonPayload = JSON.stringify(currentPayload);
+        await db.runAsync(
+          `UPDATE guest_documents SET extracted_data_json = ? WHERE submission_id = ?;`,
+          [jsonPayload, submission.id]
+        );
+      }
+
+      // If fully finished, transition to PENDING_REVIEW
       if (normalizedStatus === 'COMPLETED') {
-        const dataPayload =
-          result.extracted_data ||
-          result.result ||
-          result.data ||
-          result;
-
-        const jsonPayload = JSON.stringify(dataPayload);
+        const finalPayload = currentPayload || result;
+        const jsonPayload = JSON.stringify(finalPayload);
 
         // Persist extracted JSON to guest_documents table
         await db.runAsync(
