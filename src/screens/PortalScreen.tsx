@@ -23,11 +23,13 @@ export const PortalScreen: React.FC<PortalScreenProps> = ({ submissionId, onClos
 
   // Screen state
   const [loadingWeb, setLoadingWeb] = useState<boolean>(true);
-  const [currentUrl, setCurrentUrl] = useState<string>('https://indianfrro.gov.in/frro/FormC/login.jsp');
+  const [currentUrl, setCurrentUrl] = useState<string>(
+    'https://indianfrro.gov.in/frro/FormC/login.jsp'
+  );
   const [guestData, setGuestData] = useState<any>(null);
 
   /**
-   * Loads verified guest Form-C data from local SQLite database on mount.
+   * Loads verified guest Form-C data from the local SQLite database on mount.
    */
   useEffect(() => {
     const fetchGuestRecord = async () => {
@@ -52,7 +54,7 @@ export const PortalScreen: React.FC<PortalScreenProps> = ({ submissionId, onClos
   }, [submissionId]);
 
   /**
-   * Handles diagnostic messages sent back from the WebView JavaScript context.
+   * Handles diagnostic feedback messages returned from the WebView JavaScript context.
    */
   const handleWebViewMessage = (event: WebViewMessageEvent) => {
     try {
@@ -61,7 +63,10 @@ export const PortalScreen: React.FC<PortalScreenProps> = ({ submissionId, onClos
         if (data.success) {
           Alert.alert('Autofill Succeeded', data.message);
         } else {
-          Alert.alert('Autofill Notice', `${data.message}\n\nDetected Inputs on Page:\n${data.foundInputs || 'None'}`);
+          Alert.alert(
+            'Autofill Notice',
+            `${data.message}\n\nDetected Inputs on Page:\n${data.foundInputs || 'None'}`
+          );
         }
       } else if (data.type === 'AUTOFILL_FORM_RESULT') {
         Alert.alert(data.success ? 'Form Autofill' : 'Notice', data.message);
@@ -73,8 +78,7 @@ export const PortalScreen: React.FC<PortalScreenProps> = ({ submissionId, onClos
 
   /**
    * Action: Injects stored portal credentials into login DOM inputs.
-   * Traverses main document, sub-frames, and iframes.
-   * Uses prototype value setter to bypass portal event trapping.
+   * Traverses main document, sub-frames, and iframes using prototype value setters.
    */
   const handleAutofillLogin = async () => {
     try {
@@ -97,7 +101,7 @@ export const PortalScreen: React.FC<PortalScreenProps> = ({ submissionId, onClos
             var targetUserVal = ${sanitizedUser};
             var targetPassVal = ${sanitizedPass};
 
-            // Helper to deeply set an input value and trigger native events
+            // Prototype setter helper to bypass portal event trapping
             function applyInputValue(inputEl, value) {
               if (!inputEl) return;
               inputEl.focus();
@@ -112,7 +116,7 @@ export const PortalScreen: React.FC<PortalScreenProps> = ({ submissionId, onClos
               inputEl.dispatchEvent(new Event('blur', { bubbles: true }));
             }
 
-            // Search both main document and any accessible iframes / frames
+            // Search both main document and accessible frames
             var searchContexts = [document];
             var iframes = document.querySelectorAll('iframe, frame');
             for (var i = 0; i < iframes.length; i++) {
@@ -130,7 +134,7 @@ export const PortalScreen: React.FC<PortalScreenProps> = ({ submissionId, onClos
             for (var c = 0; c < searchContexts.length; c++) {
               var ctx = searchContexts[c];
 
-              // 1. Direct attribute selectors (matching Form-C source specifications)
+              // Direct attribute selectors
               if (!userInput) {
                 userInput = ctx.querySelector('input[name="u_id"]') ||
                             ctx.querySelector('#u_id') ||
@@ -145,14 +149,13 @@ export const PortalScreen: React.FC<PortalScreenProps> = ({ submissionId, onClos
                             ctx.querySelector('input[type="password"]');
               }
 
-              // Collect diagnostic list of inputs for debugging
               var allInputs = ctx.querySelectorAll('input');
               for (var k = 0; k < allInputs.length; k++) {
                 var inp = allInputs[k];
                 recordedInputs.push(inp.name ? ('name=' + inp.name) : (inp.id ? ('id=' + inp.id) : ('type=' + inp.type)));
               }
 
-              // 2. Generic heuristic fallback: if password field found, take the text field preceding it
+              // Fallback: previous input before password
               if (passInput && !userInput) {
                 var allCtxInputs = Array.from(ctx.querySelectorAll('input'));
                 var passIdx = allCtxInputs.indexOf(passInput);
@@ -203,7 +206,8 @@ export const PortalScreen: React.FC<PortalScreenProps> = ({ submissionId, onClos
   };
 
   /**
-   * Action: Injects verified guest values into the Form-C arrival registration form.
+   * Action: Injects verified guest values into the Form-C arrival registration form DOM.
+   * Maps surname, given name, passport details, visa details, and travel origins/destinations.
    */
   const handleAutofillGuestData = () => {
     if (!guestData) {
@@ -219,6 +223,7 @@ export const PortalScreen: React.FC<PortalScreenProps> = ({ submissionId, onClos
           var data = ${payloadJson};
           var fieldsUpdated = 0;
 
+          // Helper to populate standard text inputs using prototype setter
           function setField(selectors, val) {
             if (!val) return;
             for (var i = 0; i < selectors.length; i++) {
@@ -240,6 +245,7 @@ export const PortalScreen: React.FC<PortalScreenProps> = ({ submissionId, onClos
             }
           }
 
+          // Helper to select matching option in standard dropdowns
           function setSelect(selectors, targetText) {
             if (!targetText) return;
             for (var i = 0; i < selectors.length; i++) {
@@ -260,22 +266,31 @@ export const PortalScreen: React.FC<PortalScreenProps> = ({ submissionId, onClos
             }
           }
 
-          // 1. Foreigner Name fields (Surname First / Given Name)
-          setField(['input[name="sur_name"]', '#sur_name', 'input[name="surname"]'], data.surname);
-          setField(['input[name="given_name"]', '#given_name', 'input[name="first_name"]'], data.givenName);
+          // Helper to resolve field value supporting both camelCase and snake_case keys
+          function getVal(keyCamel, keySnake) {
+            var val = data[keyCamel] || data[keySnake];
+            if (val && typeof val === 'object' && 'value' in val) {
+              return val.value;
+            }
+            return val || '';
+          }
+
+          // 1. Foreigner Name fields (Surname First / Given Names)
+          setField(['input[name="sur_name"]', '#sur_name', 'input[name="surname"]'], getVal('surname', 'surname'));
+          setField(['input[name="given_name"]', '#given_name', 'input[name="first_name"]'], getVal('givenName', 'given_names') || getVal('givenName', 'given_name'));
 
           // 2. Passport & Identity
-          setField(['input[name="pass_num"]', '#pass_num', 'input[name="passport_no"]'], data.passportNumber);
-          setSelect(['select[name="nationality"]', '#nationality', 'select[name="spl_category"]'], data.nationality);
-          setField(['input[name="dob"]', '#dob', 'input[name="date_of_birth"]'], data.dateOfBirth);
+          setField(['input[name="pass_num"]', '#pass_num', 'input[name="passport_no"]'], getVal('passportNumber', 'passport_number'));
+          setSelect(['select[name="nationality"]', '#nationality', 'select[name="spl_category"]'], getVal('nationality', 'nationality'));
+          setField(['input[name="dob"]', '#dob', 'input[name="date_of_birth"]'], getVal('dateOfBirth', 'date_of_birth'));
 
           // 3. Visa / OCI Details
-          setField(['input[name="visa_num"]', '#visa_num', 'input[name="visa_number"]'], data.visaNumber);
+          setField(['input[name="visa_num"]', '#visa_num', 'input[name="visa_number"]'], getVal('visaNumber', 'visa_number'));
 
-          // 4. Arrival & Departure details
-          setField(['input[name="arri_from"]', '#arri_from', 'input[name="arrived_from"]'], data.arrivedFrom);
-          setField(['input[name="proc_to"]', '#proc_to', 'input[name="proceeding_to"]'], data.proceedingTo);
-          setField(['input[name="purpose_of_visit"]', '#purpose_of_visit', 'input[name="purpose"]'], data.purposeOfVisit || 'Tourism');
+          // 4. Arrival & Departure Details (Form-C Rule 14)
+          setField(['input[name="arri_from"]', '#arri_from', 'input[name="arrived_from"]'], getVal('arrivedFrom', 'arrived_from'));
+          setField(['input[name="proc_to"]', '#proc_to', 'input[name="proceeding_to"]'], getVal('proceedingTo', 'proceeding_to'));
+          setField(['input[name="purpose_of_visit"]', '#purpose_of_visit', 'input[name="purpose"]'], getVal('purposeOfVisit', 'purpose_of_visit') || 'Tourism');
 
           window.ReactNativeWebView.postMessage(JSON.stringify({
             type: 'AUTOFILL_FORM_RESULT',
