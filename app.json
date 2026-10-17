@@ -11,15 +11,15 @@
       "resizeMode": "contain",
       "backgroundColor": "#ffffff"
     },
-    // Android-specific configuration required for standalone build
     "android": {
       "adaptiveIcon": {
-        "foregroundImage": "./assets/adaptive-icon.png",
+        // Point to icon.png instead of missing adaptive-icon.png
+        "foregroundImage": "./assets/icon.png",
         "backgroundColor": "#ffffff"
       },
-      // Unique application identifier required to build an installable APK
+      // Unique application package identifier
       "package": "com.asymptoteteam.homestaymobileapp",
-      // Grants permission to reach your public API over cellular data and Wi-Fi
+      // Network permission for reaching your public API
       "permissions": [
         "android.permission.INTERNET"
       ]
