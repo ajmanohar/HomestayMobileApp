@@ -1,3 +1,14 @@
+/**
+ * DashboardScreen.tsx
+ * Primary operational dashboard for Homestay Document Capture & Processing.
+ * 
+ * Responsibilities:
+ * - Displays active guest document capture batches and statuses.
+ * - Manages submission re-extraction triggers with automatic residual cache invalidation.
+ * - Renders granular per-document service pipeline status pills (Passport, Visa, Stamp, Form-C).
+ * - Interfaces with secure storage for encrypted Form-C portal credentials.
+ */
+
 import React, { useState, useEffect, useCallback } from 'react';
 import {
   View,
@@ -11,7 +22,11 @@ import {
   Modal,
   TextInput,
 } from 'react-native';
+
+// App theme context and dark/light mode tokens
 import { useAppTheme } from '../theme/ThemeContext';
+
+// Local SQLite database providers and models
 import {
   getAllSubmissions,
   openDatabase,
@@ -20,8 +35,14 @@ import {
   GuestDocumentRecord,
   SubmissionStatus,
 } from '../db/database';
+
+// Asynchronous background synchronization services
 import { runFullSync, pollJobUntilComplete } from '../services/syncManager';
+
+// HTTP boundary client for remote FastAPI document ingestion
 import { submitGuestDocuments } from '../services/apiService';
+
+// Secure credentials store for Form-C portal automation
 import {
   getPortalCredentials,
   savePortalCredentials,
@@ -73,16 +94,19 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
    */
   const loadSubmissions = useCallback(async () => {
     try {
+      // Fetch master submission headers from SQLite
       const rawRecords = await getAllSubmissions();
       // Guard against undefined or null SQLite return values
       const records = Array.isArray(rawRecords) ? rawRecords : [];
 
+      // Open SQLite database handle
       const db = await openDatabase();
 
       // Query guest documents for each submission with defensive array checks
       const loadedSubmissions: SubmissionWithGuests[] = await Promise.all(
         records.map(async (sub) => {
           try {
+            // Retrieve child guest documents linked to current submission
             const guestDocs = await db.getAllAsync<GuestDocumentRecord>(
               'SELECT * FROM guest_documents WHERE submission_id = ? ORDER BY guest_index ASC;',
               [sub.id]
@@ -101,6 +125,7 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
         })
       );
 
+      // Commit loaded submissions into component state
       setSubmissions(loadedSubmissions);
     } catch (error) {
       console.warn('[Dashboard] Error querying submissions from SQLite:', error);
@@ -118,7 +143,9 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
     setRefreshing(true);
     try {
       console.log('[Dashboard] Manual pull-to-refresh triggered.');
+      // Execute bidirectional synchronization with remote server
       await runFullSync();
+      // Re-read local SQLite database state
       await loadSubmissions();
     } catch (error: any) {
       console.warn('[Dashboard] Pull-to-refresh error:', error);
@@ -133,6 +160,7 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
    */
   const handleOpenCredentialsModal = async () => {
     try {
+      // Query encrypted credentials from Android Keystore
       const creds = await getPortalCredentials();
       setPortalUserId(creds.userId || '');
       setPortalPassword(creds.password || '');
@@ -154,6 +182,7 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
 
     try {
       setIsSavingCreds(true);
+      // Persist credentials securely
       await savePortalCredentials(portalUserId, portalPassword);
       setIsSavingCreds(false);
       setIsCredsModalVisible(false);
@@ -169,6 +198,7 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
    */
   const handleClearCredentials = async () => {
     try {
+      // Wipe credentials from Keystore
       await clearPortalCredentials();
       setPortalUserId('');
       setPortalPassword('');
@@ -180,9 +210,10 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
 
   /**
    * Resubmits an entire submission for background AI extraction without re-capturing images.
-   * Re-submission occurs strictly at the parent SUBMISSION level.
+   * Atomically invalidates stale extracted_data_json from SQLite so stage badges
+   * reflect the new job rather than previous runs.
    *
-   * @param item - The submission record to re-extract
+   * @param item The submission record to re-extract
    */
   const handleTriggerReExtract = async (item: SubmissionWithGuests) => {
     if (!item || !item.id) {
@@ -206,6 +237,21 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
       // Extract using primary guest document artifacts
       const guestDoc = guestList[0];
 
+      // Open database handle to clear stale extraction records
+      const db = await openDatabase();
+
+      // WIPE STALE EXTRACTION JSON to ensure stage badges reset to Pending / Processing
+      console.log(`[Dashboard] Invalidating stale extraction cache for submission: ${safeSubmissionId}`);
+      await db.runAsync(
+        'UPDATE guest_documents SET extracted_data_json = NULL WHERE submission_id = ?;',
+        [safeSubmissionId]
+      );
+
+      // Transition submission state to PROCESSING immediately
+      await updateSubmissionStatus(safeSubmissionId, 'PROCESSING');
+      // Reload UI so pills immediately show reset/processing status
+      await loadSubmissions();
+
       // Dispatch existing captured artifacts directly to backend FastAPI endpoint
       const response = await submitGuestDocuments(
         guestDoc.passport_bio_path,
@@ -217,18 +263,18 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
 
       console.log(`[Dashboard] Re-upload succeeded with job_id: ${response.job_id}`);
 
-      // Transition local SQLite status back to PROCESSING with new server job_id
+      // Transition local SQLite status with new server job_id
       await updateSubmissionStatus(safeSubmissionId, 'PROCESSING', response.job_id);
       await loadSubmissions();
 
-      // Kick off background polling loop so it auto-transitions to PENDING_REVIEW when done
+      // Kick off background polling loop to track progressive intermediate extractions
       pollJobUntilComplete(safeSubmissionId, response.job_id)
         .then(() => loadSubmissions())
         .catch((err) => console.warn('[Dashboard] Background polling error:', err));
 
       Alert.alert(
         'Processing Initiated',
-        `Job dispatched to server with ID: ${response.job_id.slice(0, 8)}... Stage labels will update automatically.`
+        `Job dispatched to server with ID: ${response.job_id.slice(0, 8)}... Stage labels will update progressively.`
       );
     } catch (error: any) {
       console.error(`[Dashboard] Re-extraction request failed for ${item.id}:`, error);
@@ -273,6 +319,7 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
     documentPath: string | null | undefined,
     fieldKeys: string[]
   ): StageStatus => {
+    // If no document photo was captured for this stage, flag as NOT_ATTACHED
     if (!documentPath) {
       return 'NOT_ATTACHED';
     }
@@ -288,19 +335,23 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
         return String(val).trim().length > 0;
       });
 
+      // If fields have been populated by intermediate or final server push, stage is complete
       if (hasExtractedField) {
         return 'COMPLETED';
       }
     }
 
+    // If currently executing on backend and fields are not yet populated, flag as PROCESSING
     if (submissionStatus === 'PROCESSING') {
       return 'PROCESSING';
     }
 
+    // If entire submission is finished but fields are empty, mark completed with no values
     if (submissionStatus === 'PENDING_REVIEW' || submissionStatus === 'REVIEWED') {
       return 'COMPLETED';
     }
 
+    // Otherwise stage remains pending
     return 'PENDING';
   };
 
@@ -954,3 +1005,5 @@ const styles = StyleSheet.create({
     fontWeight: '600',
   },
 });
+
+export default DashboardScreen;
