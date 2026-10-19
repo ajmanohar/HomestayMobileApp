@@ -2,15 +2,17 @@
  * ReviewScreen.tsx
  * Comprehensive Verification & Edit Screen for Guest Document Extractions.
  *
- * Features:
- * - Top 42%: Pinch-to-zoom / pan document preview synchronized to active document tab.
- * - Tab Filter: Selectively displays fields for PASSPORT, VISA, STAMP, FORM_C, or ALL.
- * - Complete Form-C Field Coverage: Handles all 12 items from Form-C (Rule 14),
- *   plus visa stamps and passport metadata.
- * - Preserves all manual edits across tabs and saves directly to local SQLite.
+ * Architecture & Features:
+ * - Top 42%: Pinch-to-zoom / pan document preview synchronized to the active document tab.
+ * - Strict Tab Isolation: Selectively displays ONLY fields extracted from the active scan
+ *   (Passport Bio, Visa/OCI, Entry Stamp, or Handwritten Form-C Rule 14).
+ * - Master Portal Tab ('ALL'): Consolidates all 26+ fields into an official Form-C submission view.
+ * - Provenance Badges: Visually highlights extraction engine (MRZ vs VLM) and confidence scores.
+ * - Native Theme Integration: Fully reactive to light/dark themes via useAppTheme.
+ * - Preserves manual overrides and writes updates directly to SQLite via openDatabase.
  */
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import {
   View,
   Text,
@@ -25,15 +27,31 @@ import {
   KeyboardAvoidingView,
   Platform,
 } from 'react-native';
+
+// Application Theme and Database Providers
 import { useAppTheme } from '../theme/ThemeContext';
 import { openDatabase, updateSubmissionStatus, GuestDocumentRecord } from '../db/database';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 
+// Available document preview tabs
+export type DocumentTabKey = 'passport' | 'visa' | 'stamp' | 'form_c' | 'photo' | 'all';
+
 interface ReviewScreenProps {
   submissionId: string;
   onFinishReview: () => void;
   onCancel: () => void;
+}
+
+/**
+ * Metadata descriptor for each Form-C field.
+ */
+interface FieldDescriptor {
+  key: keyof CompleteFormCFields;
+  label: string;
+  placeholder: string;
+  documentCategory: 'passport' | 'visa' | 'stamp' | 'form_c';
+  autoCapitalize?: 'none' | 'characters' | 'words' | 'sentences';
 }
 
 /**
@@ -76,8 +94,44 @@ export interface CompleteFormCFields {
   arrivedCountryCityIndia: string;
 }
 
-// Available document preview tabs
-type DocumentTabKey = 'passport' | 'visa' | 'stamp' | 'form_c' | 'photo' | 'all';
+/**
+ * Master Registry mapping every field to its originating scan.
+ */
+const FIELD_REGISTRY: FieldDescriptor[] = [
+  // 1. Passport Bio Scan Fields
+  { key: 'surname', label: 'Surname (As in Passport)', placeholder: 'e.g. SMITH', documentCategory: 'passport', autoCapitalize: 'characters' },
+  { key: 'givenName', label: 'Given Name(s)', placeholder: 'e.g. JOHN DOE', documentCategory: 'passport', autoCapitalize: 'characters' },
+  { key: 'sex', label: 'Sex / Gender (M / F / X)', placeholder: 'M, F, or X', documentCategory: 'passport', autoCapitalize: 'characters' },
+  { key: 'dateOfBirth', label: 'Date of Birth (YYYY-MM-DD)', placeholder: 'YYYY-MM-DD', documentCategory: 'passport', autoCapitalize: 'none' },
+  { key: 'nationality', label: 'Nationality', placeholder: 'e.g. CANADIAN', documentCategory: 'passport', autoCapitalize: 'characters' },
+  { key: 'passportNumber', label: 'Passport Number', placeholder: 'Alphanumeric passport no.', documentCategory: 'passport', autoCapitalize: 'characters' },
+  { key: 'passportExpiryDate', label: 'Passport Expiration Date', placeholder: 'YYYY-MM-DD', documentCategory: 'passport', autoCapitalize: 'none' },
+
+  // 2. Visa / OCI Scan Fields
+  { key: 'visaNumber', label: 'Visa / OCI Number', placeholder: 'e.g. V1234567', documentCategory: 'visa', autoCapitalize: 'characters' },
+  { key: 'visaType', label: 'Visa Type / Category', placeholder: 'e.g. TOURIST', documentCategory: 'visa', autoCapitalize: 'characters' },
+  { key: 'visaIssueDate', label: 'Visa Issue Date', placeholder: 'YYYY-MM-DD', documentCategory: 'visa', autoCapitalize: 'none' },
+  { key: 'visaExpiryDate', label: 'Visa Expiry Date', placeholder: 'YYYY-MM-DD', documentCategory: 'visa', autoCapitalize: 'none' },
+  { key: 'visaPlaceOfIssue', label: 'Visa Place of Issue', placeholder: 'e.g. OTTAWA', documentCategory: 'visa', autoCapitalize: 'characters' },
+
+  // 3. Entry Immigration Stamp Fields
+  { key: 'arrivalDateIndia', label: 'Date of Arrival in India', placeholder: 'YYYY-MM-DD', documentCategory: 'stamp', autoCapitalize: 'none' },
+  { key: 'arrivalPortIndia', label: 'Port of Arrival in India', placeholder: 'e.g. COCHIN AIRPORT', documentCategory: 'stamp', autoCapitalize: 'characters' },
+
+  // 4. Handwritten Form-C Arrival Report (Rule 14) Fields
+  { key: 'permanentAddress', label: 'Permanent Residential Address Abroad', placeholder: 'Street address in country of residence', documentCategory: 'form_c', autoCapitalize: 'words' },
+  { key: 'city', label: 'City of Residence', placeholder: 'e.g. Toronto', documentCategory: 'form_c', autoCapitalize: 'words' },
+  { key: 'country', label: 'Country of Residence', placeholder: 'e.g. Canada', documentCategory: 'form_c', autoCapitalize: 'words' },
+  { key: 'contactEmail', label: 'Email Address', placeholder: 'guest@example.com', documentCategory: 'form_c', autoCapitalize: 'none' },
+  { key: 'contactPhone', label: 'Telephone / Mobile Number', placeholder: '+1 234 567 8900', documentCategory: 'form_c', autoCapitalize: 'none' },
+  { key: 'arrivalDatetimeHomestay', label: 'Date & Time of Arrival at Homestay', placeholder: 'YYYY-MM-DD HH:MM', documentCategory: 'form_c', autoCapitalize: 'none' },
+  { key: 'arrivedFrom', label: 'Arrived From (Previous Transit / City)', placeholder: 'e.g. London, UK', documentCategory: 'form_c', autoCapitalize: 'words' },
+  { key: 'proceedingTo', label: 'Proceeding To (Next Destination)', placeholder: 'e.g. Munnar, Kerala', documentCategory: 'form_c', autoCapitalize: 'words' },
+  { key: 'stayDurationIndia', label: 'Proposed Duration of Stay in India', placeholder: 'e.g. 14 Days', documentCategory: 'form_c', autoCapitalize: 'words' },
+  { key: 'purposeOfVisit', label: 'Purpose of Visit & Profession', placeholder: 'e.g. Tourism, Teacher', documentCategory: 'form_c', autoCapitalize: 'words' },
+  { key: 'expectedDepartureDate', label: 'Expected Date of Departure', placeholder: 'YYYY-MM-DD', documentCategory: 'form_c', autoCapitalize: 'none' },
+  { key: 'arrivedCountryCityIndia', label: 'Country & City Arrived In India', placeholder: 'e.g. Canada, Toronto', documentCategory: 'form_c', autoCapitalize: 'words' },
+];
 
 export const ReviewScreen: React.FC<ReviewScreenProps> = ({
   submissionId,
@@ -93,7 +147,7 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
   const [selectedDocTab, setSelectedDocTab] = useState<DocumentTabKey>('passport');
   const [isSaving, setIsSaving] = useState<boolean>(false);
 
-  // Editable Form-C verified fields state
+  // Field values state
   const [formData, setFormData] = useState<CompleteFormCFields>({
     surname: '',
     givenName: '',
@@ -126,6 +180,9 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
     arrivedCountryCityIndia: '',
   });
 
+  // Metadata tracking provenance source and confidence scores per field
+  const [metadata, setMetadata] = useState<Record<string, { confidence: number; source: string }>>({});
+
   /**
    * Loads the guest document record and parses extracted JSON on initial mount.
    */
@@ -149,52 +206,62 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
             try {
               const parsed = JSON.parse(doc.extracted_data_json);
 
-              // Helper function to extract string values whether flat or wrapped in { value, confidence }
-              const extractVal = (field: any, fallback: string = ''): string => {
-                if (field === null || field === undefined) {
+              const metaMap: Record<string, { confidence: number; source: string }> = {};
+
+              // Helper function to extract string values and capture provenance metadata
+              const extractField = (fieldObj: any, key: string, fallback: string = ''): string => {
+                if (fieldObj === null || fieldObj === undefined) {
+                  metaMap[key] = { confidence: 0.0, source: 'unassigned' };
                   return fallback;
                 }
-                if (typeof field === 'object' && 'value' in field) {
-                  return field.value !== null && field.value !== undefined ? String(field.value) : fallback;
+                if (typeof fieldObj === 'object' && 'value' in fieldObj) {
+                  metaMap[key] = {
+                    confidence: typeof fieldObj.confidence === 'number' ? fieldObj.confidence : 0.80,
+                    source: fieldObj.source || 'qwen2_vl',
+                  };
+                  return fieldObj.value !== null && fieldObj.value !== undefined ? String(fieldObj.value) : fallback;
                 }
-                return String(field);
+                metaMap[key] = { confidence: 0.80, source: 'raw_string' };
+                return String(fieldObj);
               };
 
               setFormData({
                 // Passport fields
-                surname: extractVal(parsed.surname || parsed.last_name),
-                givenName: extractVal(parsed.given_names || parsed.given_name || parsed.first_name),
-                sex: extractVal(parsed.sex),
-                dateOfBirth: extractVal(parsed.date_of_birth || parsed.dob),
-                nationality: extractVal(parsed.nationality),
-                passportNumber: extractVal(parsed.passport_number || parsed.passport_no || parsed.pass_num),
-                passportExpiryDate: extractVal(parsed.passport_expiry_date || parsed.expiry_date),
+                surname: extractField(parsed.surname || parsed.last_name, 'surname'),
+                givenName: extractField(parsed.given_names || parsed.given_name || parsed.first_name, 'givenName'),
+                sex: extractField(parsed.sex, 'sex'),
+                dateOfBirth: extractField(parsed.date_of_birth || parsed.dob, 'dateOfBirth'),
+                nationality: extractField(parsed.nationality, 'nationality'),
+                passportNumber: extractField(parsed.passport_number || parsed.passport_no || parsed.pass_num, 'passportNumber'),
+                passportExpiryDate: extractField(parsed.passport_expiry_date || parsed.expiry_date, 'passportExpiryDate'),
 
                 // Visa fields
-                visaNumber: extractVal(parsed.visa_number || parsed.visa_no || parsed.visa_num),
-                visaType: extractVal(parsed.visa_type, 'TOURIST'),
-                visaIssueDate: extractVal(parsed.visa_issue_date || parsed.issue_date),
-                visaExpiryDate: extractVal(parsed.visa_expiry_date),
-                visaPlaceOfIssue: extractVal(parsed.visa_place_of_issue || parsed.place_of_issue),
+                visaNumber: extractField(parsed.visa_number || parsed.visa_no || parsed.visa_num, 'visaNumber'),
+                visaType: extractField(parsed.visa_type, 'visaType', 'TOURIST'),
+                visaIssueDate: extractField(parsed.visa_issue_date || parsed.issue_date, 'visaIssueDate'),
+                visaExpiryDate: extractField(parsed.visa_expiry_date, 'visaExpiryDate'),
+                visaPlaceOfIssue: extractField(parsed.visa_place_of_issue || parsed.place_of_issue, 'visaPlaceOfIssue'),
 
                 // Stamp fields
-                arrivalDateIndia: extractVal(parsed.arrival_date_india || parsed.arrival_date),
-                arrivalPortIndia: extractVal(parsed.arrival_port_india || parsed.arrival_port),
+                arrivalDateIndia: extractField(parsed.arrival_date_india || parsed.arrival_date, 'arrivalDateIndia'),
+                arrivalPortIndia: extractField(parsed.arrival_port_india || parsed.arrival_port, 'arrivalPortIndia'),
 
                 // Form-C Arrival Report fields
-                permanentAddress: extractVal(parsed.permanent_address || parsed.full_address),
-                city: extractVal(parsed.city),
-                country: extractVal(parsed.country),
-                contactEmail: extractVal(parsed.contact_email || parsed.email),
-                contactPhone: extractVal(parsed.contact_phone || parsed.telephone_mobile),
-                arrivalDatetimeHomestay: extractVal(parsed.arrival_datetime_homestay || parsed.datetime_arrival_homestay),
-                arrivedFrom: extractVal(parsed.arrived_from || parsed.arri_from),
-                proceedingTo: extractVal(parsed.proceeding_to || parsed.proc_to),
-                stayDurationIndia: extractVal(parsed.stay_duration_india || parsed.proposed_duration_stay_india),
-                purposeOfVisit: extractVal(parsed.purpose_of_visit || parsed.purpose_of_visit_profession, 'Tourism'),
-                expectedDepartureDate: extractVal(parsed.expected_departure_date || parsed.expected_date_departure),
-                arrivedCountryCityIndia: extractVal(parsed.arrived_country_city_india || parsed.country_city_arrived_to_india),
+                permanentAddress: extractField(parsed.permanent_address || parsed.full_address, 'permanentAddress'),
+                city: extractField(parsed.city, 'city'),
+                country: extractField(parsed.country, 'country'),
+                contactEmail: extractField(parsed.contact_email || parsed.email, 'contactEmail'),
+                contactPhone: extractField(parsed.contact_phone || parsed.telephone_mobile, 'contactPhone'),
+                arrivalDatetimeHomestay: extractField(parsed.arrival_datetime_homestay || parsed.datetime_arrival_homestay, 'arrivalDatetimeHomestay'),
+                arrivedFrom: extractField(parsed.arrived_from || parsed.arri_from, 'arrivedFrom'),
+                proceedingTo: extractField(parsed.proceeding_to || parsed.proc_to, 'proceedingTo'),
+                stayDurationIndia: extractField(parsed.stay_duration_india || parsed.proposed_duration_stay_india, 'stayDurationIndia'),
+                purposeOfVisit: extractField(parsed.purpose_of_visit || parsed.purpose_of_visit_profession, 'purposeOfVisit', 'Tourism'),
+                expectedDepartureDate: extractField(parsed.expected_departure_date || parsed.expected_date_departure, 'expectedDepartureDate'),
+                arrivedCountryCityIndia: extractField(parsed.arrived_country_city_india || parsed.country_city_arrived_to_india, 'arrivedCountryCityIndia'),
               });
+
+              setMetadata(metaMap);
             } catch (err) {
               console.warn('[ReviewScreen] Could not parse extracted JSON payload:', err);
             }
@@ -211,10 +278,14 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
   }, [submissionId]);
 
   /**
-   * Updates specific field value in state.
+   * Updates specific field value in state and tags it as manually verified.
    */
   const handleFieldChange = (field: keyof CompleteFormCFields, value: string) => {
     setFormData((prev) => ({ ...prev, [field]: value }));
+    setMetadata((prev) => ({
+      ...prev,
+      [field]: { confidence: 1.0, source: 'manual_edit' },
+    }));
   };
 
   /**
@@ -225,8 +296,20 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
       setIsSaving(true);
       const db = await openDatabase();
 
+      // Wrap values with metadata for consistency
+      const outputPayload: Record<string, any> = {};
+      (Object.keys(formData) as Array<keyof CompleteFormCFields>).forEach((k) => {
+        const val = formData[k];
+        const meta = metadata[k] || { confidence: 1.0, source: 'manual_verification' };
+        outputPayload[k] = {
+          value: val.trim() === '' ? null : val.trim(),
+          confidence: meta.confidence,
+          source: meta.source,
+        };
+      });
+
       // Persist full JSON into guest_documents table
-      const updatedJson = JSON.stringify(formData);
+      const updatedJson = JSON.stringify(outputPayload);
       await db.runAsync(
         `UPDATE guest_documents SET extracted_data_json = ? WHERE submission_id = ?;`,
         [updatedJson, submissionId]
@@ -262,10 +345,53 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
       case 'photo':
         return guestDoc.guest_photo_path;
       case 'all':
-        return guestDoc.passport_bio_path;
       default:
-        return guestDoc.passport_bio_path;
+        return guestDoc.passport_bio_path || guestDoc.form_c_path;
     }
+  };
+
+  /**
+   * Dynamically filters fields strictly matching the selected tab category.
+   * If 'all' is active, renders every field grouped for portal submission.
+   */
+  const activeFieldsToRender = useMemo(() => {
+    if (selectedDocTab === 'all') {
+      return FIELD_REGISTRY;
+    }
+    if (selectedDocTab === 'photo') {
+      return FIELD_REGISTRY.filter((f) => f.key === 'givenName' || f.key === 'surname');
+    }
+    return FIELD_REGISTRY.filter((f) => f.documentCategory === selectedDocTab);
+  }, [selectedDocTab]);
+
+  // Confidence badge color helper
+  const renderConfidenceBadge = (fieldKey: keyof CompleteFormCFields) => {
+    const meta = metadata[fieldKey] || { confidence: 0, source: 'unassigned' };
+    const pct = Math.round(meta.confidence * 100);
+
+    let badgeBg = '#FFEBEE';
+    let badgeText = '#C62828';
+    let label = `${pct}% Low`;
+
+    if (meta.source === 'manual_edit' || meta.source === 'manual_verification') {
+      badgeBg = '#E0F2FE';
+      badgeText = '#0284C7';
+      label = 'Edited ✍';
+    } else if (meta.confidence >= 0.85) {
+      badgeBg = '#E8F5E9';
+      badgeText = '#2E7D32';
+      label = `${pct}% High`;
+    } else if (meta.confidence >= 0.50) {
+      badgeBg = '#FFF8E1';
+      badgeText = '#F57F17';
+      label = `${pct}% Med`;
+    }
+
+    return (
+      <View style={[styles.confidenceBadge, { backgroundColor: badgeBg }]}>
+        <Text style={[styles.confidenceBadgeText, { color: badgeText }]}>{label}</Text>
+      </View>
+    );
   };
 
   if (loading) {
@@ -277,28 +403,6 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
   }
 
   const activeImage = getActiveImageUri();
-
-  // Helper renderer for an individual form text field
-  const renderField = (label: string, fieldKey: keyof CompleteFormCFields, placeholder: string) => (
-    <View style={styles.fieldGroup} key={fieldKey}>
-      <Text style={[styles.label, { color: colors.textMuted }]}>{label}</Text>
-      <TextInput
-        style={[
-          styles.input,
-          {
-            backgroundColor: colors.surface,
-            color: colors.textPrimary,
-            borderColor: colors.border,
-          },
-        ]}
-        value={formData[fieldKey]}
-        onChangeText={(text) => handleFieldChange(fieldKey, text)}
-        placeholder={placeholder}
-        placeholderTextColor={colors.textMuted}
-        autoCapitalize="characters"
-      />
-    </View>
-  );
 
   return (
     <View style={[styles.container, { backgroundColor: colors.background }]}>
@@ -342,7 +446,7 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
                     },
                   ]}
                 >
-                  {tabKey === 'form_c' ? 'FORM-C' : tabKey.toUpperCase()}
+                  {tabKey === 'form_c' ? 'FORM-C' : tabKey === 'all' ? '★ ALL' : tabKey.toUpperCase()}
                 </Text>
               </TouchableOpacity>
             ))}
@@ -361,7 +465,7 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
                 centerContent={true}
               >
                 <Image
-                  source={{ uri: activeImage }}
+                  source={{ uri: activeImage.startsWith('file://') ? activeImage : `file://${activeImage}` }}
                   style={styles.previewImage}
                   resizeMode="contain"
                 />
@@ -369,7 +473,7 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
             ) : (
               <View style={styles.emptyImageContainer}>
                 <Text style={[styles.emptyImageText, { color: colors.textMuted }]}>
-                  No image available for this document
+                  No image scan attached for this document stage
                 </Text>
               </View>
             )}
@@ -379,83 +483,55 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
           </View>
         </View>
 
-        {/* Bottom 58%: Tab-Filtered Editable Form Fields */}
+        {/* Bottom 58%: Strictly Isolated Form Fields Matching Active Tab */}
         <ScrollView contentContainerStyle={styles.formContent} keyboardShouldPersistTaps="handled">
-          {/* Section: PASSPORT */}
-          {(selectedDocTab === 'passport' || selectedDocTab === 'all') && (
-            <View style={styles.sectionContainer}>
-              <Text style={[styles.sectionHeading, { color: colors.primaryBrand }]}>
-                🛂 Passport / Identity Details
-              </Text>
-              {renderField('Surname (As in Passport)', 'surname', 'e.g. DOE')}
-              {renderField('Given Name(s)', 'givenName', 'e.g. JOHN')}
-              {renderField('Sex (M / F / O)', 'sex', 'M')}
-              {renderField('Date of Birth (YYYY-MM-DD)', 'dateOfBirth', 'YYYY-MM-DD')}
-              {renderField('Nationality', 'nationality', 'e.g. American')}
-              {renderField('Passport Number', 'passportNumber', 'e.g. A12345678')}
-              {renderField('Passport Expiry Date', 'passportExpiryDate', 'YYYY-MM-DD')}
-            </View>
-          )}
+          <View style={styles.sectionHeaderRow}>
+            <Text style={[styles.sectionHeading, { color: colors.primaryBrand }]}>
+              {selectedDocTab === 'all'
+                ? '★ Complete Form-C Master Record'
+                : selectedDocTab === 'photo'
+                ? '👤 Passport Portrait Verification'
+                : `Extracted from ${selectedDocTab.toUpperCase()} Scan`}
+            </Text>
+            <Text style={[styles.sectionCountText, { color: colors.textMuted }]}>
+              {activeFieldsToRender.length} Field(s)
+            </Text>
+          </View>
 
-          {/* Section: VISA */}
-          {(selectedDocTab === 'visa' || selectedDocTab === 'all') && (
-            <View style={styles.sectionContainer}>
-              <Text style={[styles.sectionHeading, { color: colors.primaryBrand }]}>
-                📑 Visa / OCI Details
-              </Text>
-              {renderField('Visa / OCI Number', 'visaNumber', 'e.g. V1234567')}
-              {renderField('Visa Type', 'visaType', 'e.g. TOURIST')}
-              {renderField('Visa Issue Date', 'visaIssueDate', 'YYYY-MM-DD')}
-              {renderField('Visa Expiry Date', 'visaExpiryDate', 'YYYY-MM-DD')}
-              {renderField('Visa Place of Issue', 'visaPlaceOfIssue', 'e.g. LONDON')}
-            </View>
-          )}
+          {/* Render Only Fields Belonging to the Active Category */}
+          {activeFieldsToRender.map((descriptor) => {
+            const meta = metadata[descriptor.key] || { confidence: 0, source: 'unassigned' };
+            return (
+              <View style={styles.fieldGroup} key={descriptor.key}>
+                <View style={styles.labelRow}>
+                  <Text style={[styles.label, { color: colors.textMuted }]}>
+                    {descriptor.label}
+                  </Text>
+                  {renderConfidenceBadge(descriptor.key)}
+                </View>
 
-          {/* Section: STAMP */}
-          {(selectedDocTab === 'stamp' || selectedDocTab === 'all') && (
-            <View style={styles.sectionContainer}>
-              <Text style={[styles.sectionHeading, { color: colors.primaryBrand }]}>
-                🛬 Entry Immigration Stamp
-              </Text>
-              {renderField('Date of Arrival in India', 'arrivalDateIndia', 'YYYY-MM-DD')}
-              {renderField('Port of Arrival in India', 'arrivalPortIndia', 'e.g. COCHIN AIRPORT')}
-            </View>
-          )}
+                <TextInput
+                  style={[
+                    styles.input,
+                    {
+                      backgroundColor: colors.surface,
+                      color: colors.textPrimary,
+                      borderColor: colors.border,
+                    },
+                  ]}
+                  value={formData[descriptor.key]}
+                  onChangeText={(text) => handleFieldChange(descriptor.key, text)}
+                  placeholder={descriptor.placeholder}
+                  placeholderTextColor={colors.textMuted}
+                  autoCapitalize={descriptor.autoCapitalize || 'sentences'}
+                />
 
-          {/* Section: FORM-C ARRIVAL REPORT (Rule 14) */}
-          {(selectedDocTab === 'form_c' || selectedDocTab === 'all') && (
-            <View style={styles.sectionContainer}>
-              <Text style={[styles.sectionHeading, { color: colors.primaryBrand }]}>
-                📝 Form-C Arrival Report (Rule 14)
-              </Text>
-              {renderField('Permanent Address in Country of Residence', 'permanentAddress', 'Street address')}
-              {renderField('City', 'city', 'City')}
-              {renderField('Country', 'country', 'Country of residence')}
-              {renderField('Email Address', 'contactEmail', 'guest@example.com')}
-              {renderField('Telephone / Mobile Number', 'contactPhone', '+1 234 567 8900')}
-              {renderField('Date & Time of Arrival in Homestay', 'arrivalDatetimeHomestay', 'YYYY-MM-DD HH:MM')}
-              {renderField('Arrived From (City / Country)', 'arrivedFrom', 'e.g. London, UK')}
-              {renderField('Proceeding To (Destination)', 'proceedingTo', 'e.g. Munnar, Kerala')}
-              {renderField('Proposed Duration of Stay in India', 'stayDurationIndia', 'e.g. 14 Days')}
-              {renderField('Purpose of Visit & Profession', 'purposeOfVisit', 'Tourism')}
-              {renderField('Expected Date of Departure', 'expectedDepartureDate', 'YYYY-MM-DD')}
-              {renderField('Country & City You Arrived to India', 'arrivedCountryCityIndia', 'e.g. UK, London')}
-            </View>
-          )}
-
-          {/* Section: PHOTO */}
-          {selectedDocTab === 'photo' && (
-            <View style={styles.sectionContainer}>
-              <Text style={[styles.sectionHeading, { color: colors.primaryBrand }]}>
-                👤 Guest Portrait Photo
-              </Text>
-              <Text style={[styles.helperText, { color: colors.textMuted }]}>
-                Passport portrait photo cropped for portal upload. You can review or edit guest names below:
-              </Text>
-              {renderField('Given Name(s)', 'givenName', 'e.g. JOHN')}
-              {renderField('Surname', 'surname', 'e.g. DOE')}
-            </View>
-          )}
+                <Text style={styles.sourceCaption}>
+                  Source: {meta.source}
+                </Text>
+              </View>
+            );
+          })}
 
           {/* Confirm & Save Button */}
           <TouchableOpacity
@@ -466,7 +542,7 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
             {isSaving ? (
               <ActivityIndicator color="#FFFFFF" />
             ) : (
-              <Text style={styles.confirmButtonText}>Confirm & Mark Reviewed ✓</Text>
+              <Text style={styles.confirmButtonText}>Save & Confirm Form-C Record ✓</Text>
             )}
           </TouchableOpacity>
 
@@ -499,10 +575,10 @@ const styles = StyleSheet.create({
   },
   headerTitle: {
     fontSize: 17,
-    fontWeight: '600',
+    fontWeight: '700',
   },
   headerButton: {
-    padding: 4,
+    padding: 6,
   },
   headerButtonText: {
     fontSize: 15,
@@ -529,7 +605,7 @@ const styles = StyleSheet.create({
   tabButton: {
     justifyContent: 'center',
     alignItems: 'center',
-    paddingHorizontal: 4,
+    paddingHorizontal: 6,
     borderBottomWidth: 2,
   },
   tabButtonText: {
@@ -556,9 +632,11 @@ const styles = StyleSheet.create({
     flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
+    paddingHorizontal: 24,
   },
   emptyImageText: {
     fontSize: 13,
+    textAlign: 'center',
   },
   zoomHintBadge: {
     position: 'absolute',
@@ -578,26 +656,43 @@ const styles = StyleSheet.create({
     padding: 16,
     paddingBottom: 48,
   },
-  sectionContainer: {
-    marginBottom: 8,
+  sectionHeaderRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 12,
   },
   sectionHeading: {
     fontSize: 15,
     fontWeight: '700',
-    marginBottom: 12,
-    marginTop: 4,
   },
-  helperText: {
+  sectionCountText: {
     fontSize: 12,
-    marginBottom: 10,
+    fontWeight: '500',
   },
   fieldGroup: {
-    marginBottom: 12,
+    marginBottom: 14,
+  },
+  labelRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 4,
   },
   label: {
     fontSize: 12,
-    marginBottom: 4,
     fontWeight: '600',
+    flex: 1,
+  },
+  confidenceBadge: {
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 4,
+    marginLeft: 8,
+  },
+  confidenceBadgeText: {
+    fontSize: 10,
+    fontWeight: '700',
   },
   input: {
     height: 44,
@@ -606,12 +701,18 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     fontSize: 14,
   },
+  sourceCaption: {
+    fontSize: 10,
+    color: '#94A3B8',
+    marginTop: 2,
+    textAlign: 'right',
+  },
   confirmButton: {
     height: 50,
     borderRadius: 8,
     alignItems: 'center',
     justifyContent: 'center',
-    marginTop: 16,
+    marginTop: 18,
     marginBottom: 16,
   },
   confirmButtonText: {
