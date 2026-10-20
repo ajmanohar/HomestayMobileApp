@@ -1,214 +1,169 @@
-import * as FileSystem from 'expo-file-system/legacy';
+// ==============================================================================
+// apiService.ts - HomestayMobileApp (React Native / Expo)
+// ==============================================================================
+// Client networking service for dispatching document captures to the remote
+// Dell Micro edge server over Cloudflare Tunnel (https://api.theasymptotebrief.com)
+// Secured with pre-shared Bearer token authentication matching PassportReadAPI.
+// ==============================================================================
+
+import * as FileSystem from 'expo-file-system';
+
+// ------------------------------------------------------------------------------
+// Configuration: Production endpoint and pre-shared Bearer Token
+// ------------------------------------------------------------------------------
+
+// Base URL for PassportReadAPI endpoint via Cloudflare Tunnel
+const DEFAULT_API_BASE_URL = 'https://api.theasymptotebrief.com/api/v1';
+
+// Resolve configured base URL from Expo public environment variable or fallback
+const API_BASE_URL = process.env.EXPO_PUBLIC_API_URL || DEFAULT_API_BASE_URL;
+
+// Pre-shared Bearer API key configured in /opt/PassportReadAPI/.env on the server
+const DEFAULT_BEARER_TOKEN = '388f64ef3bea954970952b97a477e9822aaf4c2fad7d3b046caf8df82a224f88';
+
+// Resolve active Bearer token from environment variable or constant
+const API_BEARER_TOKEN = process.env.EXPO_PUBLIC_API_BEARER_TOKEN || DEFAULT_BEARER_TOKEN;
 
 /**
- * Production backend API endpoint served through Cloudflare Tunnel.
+ * Common HTTP headers dictionary for JSON endpoints requiring Bearer authentication.
  */
-const BASE_URL = 'https://api.theasymptotebrief.com/api/v1';
+const getAuthHeaders = (): Record<string, string> => {
+  return {
+    'Accept': 'application/json',
+    'Authorization': `Bearer ${API_BEARER_TOKEN}`,
+  };
+};
 
-/**
- * Expected response structure when initiating an extraction job at /jobs/submit.
- */
-export interface JobSubmitResponse {
+// ------------------------------------------------------------------------------
+// Job Submission & Attachment Types
+// ------------------------------------------------------------------------------
+
+export interface CreateJobResponse {
   job_id: string;
-  status: 'QUEUED' | 'PROCESSING' | 'COMPLETED' | 'FAILED';
+  status: string;
   message?: string;
 }
 
-/**
- * Expected response structure when checking /jobs/{job_id}.
- */
 export interface JobStatusResponse {
   job_id: string;
   status: 'QUEUED' | 'PROCESSING' | 'COMPLETED' | 'FAILED';
   result?: Record<string, any>;
-  data?: Record<string, any>;
-  extracted_data?: Record<string, any>;
-  error_message?: string;
-  error?: string;
+  error_message?: string | null;
+  created_at?: string;
+  updated_at?: string;
 }
 
 /**
- * Helper to ensure a URI string has a valid file:// prefix for native Android file access.
+ * Initializes a new document extraction job by uploading the primary passport bio image.
+ * Maps to POST /api/v1/jobs/submit with multipart form data and Bearer Authorization.
  *
- * @param uri - Local file URI or path
- * @returns Standardized file:// URI
+ * @param passportBioUri Local file URI for the captured passport bio page.
+ * @returns Promise resolving to the created job identifier and initial status.
  */
-const ensureFileUri = (uri: string): string => {
-  if (uri.startsWith('file://')) {
-    return uri;
-  }
-  return `file://${uri}`;
-};
+export const submitPassportBio = async (passportBioUri: string): Promise<CreateJobResponse> => {
+  const uploadUrl = `${API_BASE_URL}/jobs/submit`;
 
-/**
- * Uploads an individual supplementary document to an existing job.
- * Uses native uploadAsync to bypass React Native Android OkHttp FormData issues.
- *
- * @param jobId - UUID of the active job
- * @param docType - Target attachment type ('visa_page', 'entry_stamp', or 'welcome_form')
- * @param filePath - Local filesystem URI of the image
- */
-export const attachDocumentToJob = async (
-  jobId: string,
-  docType: 'visa_page' | 'entry_stamp' | 'welcome_form',
-  filePath: string
-): Promise<void> => {
-  const attachUrl = `${BASE_URL}/jobs/${jobId}/attach/${docType}`;
-  const normalizedUri = ensureFileUri(filePath);
-
-  console.log(`[ApiService] Attaching ${docType} to job ${jobId}...`);
-
-  const uploadResult = await FileSystem.uploadAsync(attachUrl, normalizedUri, {
+  // Use Expo FileSystem to upload multipart file with Bearer Authorization header
+  const uploadResult = await FileSystem.uploadAsync(uploadUrl, passportBioUri, {
+    fieldName: 'passport_bio',
     httpMethod: 'POST',
     uploadType: FileSystem.FileSystemUploadType.MULTIPART,
-    fieldName: 'file',
     headers: {
-      Accept: 'application/json',
+      'Authorization': `Bearer ${API_BEARER_TOKEN}`,
     },
   });
 
   if (uploadResult.status < 200 || uploadResult.status >= 300) {
-    console.warn(
-      `[ApiService] Failed attaching ${docType} (HTTP ${uploadResult.status}): ${uploadResult.body}`
-    );
-  } else {
-    console.log(`[ApiService] Successfully attached ${docType} to job ${jobId}.`);
+    throw new Error(`Job submission failed with status ${uploadResult.status}: ${uploadResult.body}`);
+  }
+
+  const parsedBody: CreateJobResponse = JSON.parse(uploadResult.body);
+  return parsedBody;
+};
+
+/**
+ * Attaches a secondary document image to an existing background extraction job.
+ * Maps to POST /api/v1/jobs/{job_id}/attach/{doc_type} with Bearer Authorization.
+ *
+ * @param jobId Unique job UUID returned from submitPassportBio.
+ * @param docType Supported document type ('visa_page', 'entry_stamp', 'welcome_form', or 'guest_photo').
+ * @param fileUri Local filesystem URI of the image to attach.
+ */
+export const attachDocumentToJob = async (
+  jobId: string,
+  docType: 'visa_page' | 'entry_stamp' | 'welcome_form' | 'guest_photo',
+  fileUri: string
+): Promise<void> => {
+  const attachUrl = `${API_BASE_URL}/jobs/${jobId}/attach/${docType}`;
+
+  const uploadResult = await FileSystem.uploadAsync(attachUrl, fileUri, {
+    fieldName: 'file',
+    httpMethod: 'POST',
+    uploadType: FileSystem.FileSystemUploadType.MULTIPART,
+    headers: {
+      'Authorization': `Bearer ${API_BEARER_TOKEN}`,
+    },
+  });
+
+  if (uploadResult.status < 200 || uploadResult.status >= 300) {
+    throw new Error(`Failed to attach ${docType} to job ${jobId}: ${uploadResult.body}`);
   }
 };
 
 /**
- * Triggers backend queue processing after all files have finished uploading.
+ * Signals the server worker that all document uploads are complete and processing may begin.
+ * Maps to POST /api/v1/jobs/{job_id}/start with Bearer Authorization.
  *
- * @param jobId - UUID of the job to begin processing
+ * @param jobId Target job tracking UUID.
  */
 export const startJobProcessing = async (jobId: string): Promise<void> => {
-  const startUrl = `${BASE_URL}/jobs/${jobId}/start`;
-
-  console.log(`[ApiService] Triggering background extraction worker for job ${jobId}...`);
+  const startUrl = `${API_BASE_URL}/jobs/${jobId}/start`;
 
   const response = await fetch(startUrl, {
     method: 'POST',
-    headers: {
-      Accept: 'application/json',
-    },
+    headers: getAuthHeaders(),
   });
 
   if (!response.ok) {
-    const errorBody = await response.text();
-    console.warn(`[ApiService] Start worker request returned status ${response.status}: ${errorBody}`);
-  } else {
-    console.log(`[ApiService] Extraction worker successfully triggered for job ${jobId}.`);
+    const errorText = await response.text();
+    throw new Error(`Failed to start job ${jobId} (HTTP ${response.status}): ${errorText}`);
   }
 };
 
 /**
- * Submits all captured documents into the backend extraction pipeline.
- * Submits the mandatory passport bio page first, sequentially attaches
- * the visa page, entry stamp, and handwritten Form-C arrival report,
- * and finally sends the start trigger to process all documents together.
+ * Polls the current state and partial/final extracted results of a specific job.
+ * Maps to GET /api/v1/jobs/{job_id} with Bearer Authorization.
  *
- * @param passportBioPath - Local file URI for passport bio page (mandatory)
- * @param visaPath - Local file URI for visa or OCI card (optional)
- * @param entryStampPath - Local file URI for immigration arrival stamp (optional)
- * @param formCPath - Local file URI for physical Form-C arrival report (optional)
- * @param reference - Optional guest reference identifier
- * @returns Parsed JobSubmitResponse containing the assigned job_id
+ * @param jobId Unique job tracking UUID.
+ * @returns Promise resolving to the current job record including status and extracted fields.
  */
-export const submitGuestDocuments = async (
-  passportBioPath: string,
-  visaPath?: string,
-  entryStampPath?: string,
-  formCPath?: string,
-  reference?: string
-): Promise<JobSubmitResponse> => {
-  const submitUrl = `${BASE_URL}/jobs/submit`;
-
-  if (!passportBioPath) {
-    throw new Error('Passport bio page image is required for document extraction.');
-  }
-
-  const normalizedBioUri = ensureFileUri(passportBioPath);
-
-  // 1. Submit primary passport bio page to create job record and receive job_id
-  console.log('[ApiService] Submitting primary passport bio page to initialize job...');
-  const submitResult = await FileSystem.uploadAsync(submitUrl, normalizedBioUri, {
-    httpMethod: 'POST',
-    uploadType: FileSystem.FileSystemUploadType.MULTIPART,
-    fieldName: 'passport_bio',
-    headers: {
-      Accept: 'application/json',
-    },
-  });
-
-  if (submitResult.status < 200 || submitResult.status >= 300) {
-    throw new Error(
-      `Job submission failed with status ${submitResult.status}: ${submitResult.body}`
-    );
-  }
-
-  const parsedSubmit: JobSubmitResponse = JSON.parse(submitResult.body);
-  const jobId = parsedSubmit.job_id;
-  console.log(`[ApiService] Job initialized with ID: ${jobId}`);
-
-  // 2. Attach Visa / OCI image if available
-  if (visaPath && typeof visaPath === 'string' && visaPath.trim().length > 0) {
-    try {
-      await attachDocumentToJob(jobId, 'visa_page', visaPath);
-    } catch (err) {
-      console.warn('[ApiService] Error attaching visa page:', err);
-    }
-  }
-
-  // 3. Attach Entry Stamp image if available
-  if (entryStampPath && typeof entryStampPath === 'string' && entryStampPath.trim().length > 0) {
-    try {
-      await attachDocumentToJob(jobId, 'entry_stamp', entryStampPath);
-    } catch (err) {
-      console.warn('[ApiService] Error attaching entry stamp:', err);
-    }
-  }
-
-  // 4. Attach Handwritten Form-C Arrival Report if available
-  if (formCPath && typeof formCPath === 'string' && formCPath.trim().length > 0) {
-    try {
-      await attachDocumentToJob(jobId, 'welcome_form', formCPath);
-    } catch (err) {
-      console.warn('[ApiService] Error attaching welcome form:', err);
-    }
-  }
-
-  // 5. Explicitly signal the backend that all attachments are present and processing may begin
-  try {
-    await startJobProcessing(jobId);
-  } catch (err) {
-    console.warn('[ApiService] Error dispatching start trigger:', err);
-  }
-
-  return parsedSubmit;
-};
-
-/**
- * Polls the backend API for the current extraction status of a job.
- *
- * @param jobId - UUID returned by submitGuestDocuments
- * @returns JobStatusResponse containing status and extracted data
- */
-export const pollJobStatus = async (jobId: string): Promise<JobStatusResponse> => {
-  const statusUrl = `${BASE_URL}/jobs/${jobId}`;
+export const getJobStatus = async (jobId: string): Promise<JobStatusResponse> => {
+  const statusUrl = `${API_BASE_URL}/jobs/${jobId}`;
 
   const response = await fetch(statusUrl, {
     method: 'GET',
-    headers: {
-      Accept: 'application/json',
-    },
+    headers: getAuthHeaders(),
   });
 
   if (!response.ok) {
-    throw new Error(
-      `Polling failed for job ${jobId} with status ${response.status}: ${response.statusText}`
-    );
+    const errorText = await response.text();
+    throw new Error(`Failed to fetch status for job ${jobId} (HTTP ${response.status}): ${errorText}`);
   }
 
-  const result: JobStatusResponse = await response.json();
-  return result;
+  const data: JobStatusResponse = await response.json();
+  return data;
+};
+
+/**
+ * Diagnostic check to verify API connectivity.
+ * Maps to unauthenticated GET /health (public Cloudflare monitor).
+ */
+export const checkApiHealth = async (): Promise<boolean> => {
+  try {
+    const healthUrl = `${API_BASE_URL.replace('/api/v1', '')}/health`;
+    const response = await fetch(healthUrl, { method: 'GET' });
+    return response.ok;
+  } catch {
+    return false;
+  }
 };
