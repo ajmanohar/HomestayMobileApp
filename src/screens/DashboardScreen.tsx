@@ -5,6 +5,7 @@
  * Responsibilities:
  * - Displays active guest document capture batches and statuses.
  * - Manages submission re-extraction triggers with automatic residual cache invalidation.
+ * - Handles extraction failure states gracefully, preventing cards from getting stuck in PROCESSING.
  * - Renders granular per-document service pipeline status pills (Passport, Visa, Stamp, Form-C).
  * - Interfaces with secure storage for encrypted Form-C portal credentials.
  */
@@ -72,7 +73,6 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
   onOpenReview,
   onOpenPortal,
 }) => {
-  // Theme styling tokens (supports dynamic light / dark mode toggle)
   const { colors, isDark, toggleTheme } = useAppTheme();
 
   // Screen queue and processing states
@@ -90,23 +90,16 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
   /**
    * Queries local SQLite database to load recent guest submissions
    * and attaches all guest document child rows per submission.
-   * Defensively guards against undefined return values from SQLite queries.
    */
   const loadSubmissions = useCallback(async () => {
     try {
-      // Fetch master submission headers from SQLite
       const rawRecords = await getAllSubmissions();
-      // Guard against undefined or null SQLite return values
       const records = Array.isArray(rawRecords) ? rawRecords : [];
-
-      // Open SQLite database handle
       const db = await openDatabase();
 
-      // Query guest documents for each submission with defensive array checks
       const loadedSubmissions: SubmissionWithGuests[] = await Promise.all(
         records.map(async (sub) => {
           try {
-            // Retrieve child guest documents linked to current submission
             const guestDocs = await db.getAllAsync<GuestDocumentRecord>(
               'SELECT * FROM guest_documents WHERE submission_id = ? ORDER BY guest_index ASC;',
               [sub.id]
@@ -125,7 +118,6 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
         })
       );
 
-      // Commit loaded submissions into component state
       setSubmissions(loadedSubmissions);
     } catch (error) {
       console.warn('[Dashboard] Error querying submissions from SQLite:', error);
@@ -143,9 +135,7 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
     setRefreshing(true);
     try {
       console.log('[Dashboard] Manual pull-to-refresh triggered.');
-      // Execute bidirectional synchronization with remote server
       await runFullSync();
-      // Re-read local SQLite database state
       await loadSubmissions();
     } catch (error: any) {
       console.warn('[Dashboard] Pull-to-refresh error:', error);
@@ -160,7 +150,6 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
    */
   const handleOpenCredentialsModal = async () => {
     try {
-      // Query encrypted credentials from Android Keystore
       const creds = await getPortalCredentials();
       setPortalUserId(creds.userId || '');
       setPortalPassword(creds.password || '');
@@ -182,7 +171,6 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
 
     try {
       setIsSavingCreds(true);
-      // Persist credentials securely
       await savePortalCredentials(portalUserId, portalPassword);
       setIsSavingCreds(false);
       setIsCredsModalVisible(false);
@@ -198,7 +186,6 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
    */
   const handleClearCredentials = async () => {
     try {
-      // Wipe credentials from Keystore
       await clearPortalCredentials();
       setPortalUserId('');
       setPortalPassword('');
@@ -210,10 +197,9 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
 
   /**
    * Resubmits an entire submission for background AI extraction without re-capturing images.
-   * Atomically invalidates stale extracted_data_json from SQLite so stage badges
-   * reflect the new job rather than previous runs.
+   * Clears stale extraction cache and resets to UPLOAD_PENDING if an error occurs.
    *
-   * @param item The submission record to re-extract
+   * @param item - The submission record to re-extract
    */
   const handleTriggerReExtract = async (item: SubmissionWithGuests) => {
     if (!item || !item.id) {
@@ -221,38 +207,34 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
       return;
     }
 
+    const safeSubmissionId = String(item.id).trim();
+    const guestList = Array.isArray(item.guests) ? item.guests : [];
+
+    if (guestList.length === 0) {
+      Alert.alert('Error', 'No guest document records found for this submission.');
+      return;
+    }
+
+    const guestDoc = guestList[0];
+
     try {
       setRetryingId(item.id);
       console.log(`[Dashboard] Starting submission-level re-extraction for ID: ${item.id}`);
 
-      const safeSubmissionId = String(item.id).trim();
-      const guestList = Array.isArray(item.guests) ? item.guests : [];
-
-      // Retrieve locally stored image paths for guest records
-      if (guestList.length === 0) {
-        Alert.alert('Error', 'No guest document records found for this submission.');
-        return;
-      }
-
-      // Extract using primary guest document artifacts
-      const guestDoc = guestList[0];
-
-      // Open database handle to clear stale extraction records
       const db = await openDatabase();
 
-      // WIPE STALE EXTRACTION JSON to ensure stage badges reset to Pending / Processing
-      console.log(`[Dashboard] Invalidating stale extraction cache for submission: ${safeSubmissionId}`);
+      // Clear stale extraction JSON so stage badges reset
+      console.log(`[Dashboard] Invalidating stale extraction cache for: ${safeSubmissionId}`);
       await db.runAsync(
         'UPDATE guest_documents SET extracted_data_json = NULL WHERE submission_id = ?;',
         [safeSubmissionId]
       );
 
-      // Transition submission state to PROCESSING immediately
+      // Transition to PROCESSING
       await updateSubmissionStatus(safeSubmissionId, 'PROCESSING');
-      // Reload UI so pills immediately show reset/processing status
       await loadSubmissions();
 
-      // Dispatch existing captured artifacts directly to backend FastAPI endpoint
+      // Dispatch documents to backend FastAPI endpoint
       const response = await submitGuestDocuments(
         guestDoc.passport_bio_path,
         guestDoc.visa_stamp_path ?? undefined,
@@ -263,21 +245,33 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
 
       console.log(`[Dashboard] Re-upload succeeded with job_id: ${response.job_id}`);
 
-      // Transition local SQLite status with new server job_id
+      // Save new job_id in SQLite
       await updateSubmissionStatus(safeSubmissionId, 'PROCESSING', response.job_id);
       await loadSubmissions();
 
-      // Kick off background polling loop to track progressive intermediate extractions
+      // Poll in background
       pollJobUntilComplete(safeSubmissionId, response.job_id)
         .then(() => loadSubmissions())
-        .catch((err) => console.warn('[Dashboard] Background polling error:', err));
+        .catch((err) => {
+          console.warn('[Dashboard] Background polling error:', err);
+          loadSubmissions();
+        });
 
       Alert.alert(
         'Processing Initiated',
-        `Job dispatched to server with ID: ${response.job_id.slice(0, 8)}... Stage labels will update progressively.`
+        `Job dispatched to server with ID: ${response.job_id.slice(0, 8)}... Stage labels will update automatically.`
       );
     } catch (error: any) {
       console.error(`[Dashboard] Re-extraction request failed for ${item.id}:`, error);
+
+      // Reset to UPLOAD_PENDING so the card does not remain stuck on "AI extraction in progress"
+      try {
+        await updateSubmissionStatus(safeSubmissionId, 'UPLOAD_PENDING');
+        await loadSubmissions();
+      } catch (dbErr) {
+        console.warn('[Dashboard] Failed to reset status after error:', dbErr);
+      }
+
       Alert.alert(
         'Submission Failed',
         `Could not reach extraction service: ${error.message || error}`
@@ -287,14 +281,10 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
     }
   };
 
-  // Initial load of SQLite submissions on mount
   useEffect(() => {
     loadSubmissions();
   }, [loadSubmissions]);
 
-  /**
-   * Overall submission status badge visual configuration.
-   */
   const getStatusBadgeStyle = (status: SubmissionStatus) => {
     switch (status) {
       case 'UPLOAD_PENDING':
@@ -310,21 +300,16 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
     }
   };
 
-  /**
-   * Computes the granular execution status of each individual service pipeline for a guest.
-   */
   const evaluateServiceStage = (
     submissionStatus: SubmissionStatus,
     extractedData: any,
     documentPath: string | null | undefined,
     fieldKeys: string[]
   ): StageStatus => {
-    // If no document photo was captured for this stage, flag as NOT_ATTACHED
     if (!documentPath) {
       return 'NOT_ATTACHED';
     }
 
-    // Check if any of the target fields are already extracted and present
     if (extractedData && typeof extractedData === 'object') {
       const hasExtractedField = fieldKeys.some((k) => {
         const val = extractedData[k];
@@ -335,29 +320,22 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
         return String(val).trim().length > 0;
       });
 
-      // If fields have been populated by intermediate or final server push, stage is complete
       if (hasExtractedField) {
         return 'COMPLETED';
       }
     }
 
-    // If currently executing on backend and fields are not yet populated, flag as PROCESSING
     if (submissionStatus === 'PROCESSING') {
       return 'PROCESSING';
     }
 
-    // If entire submission is finished but fields are empty, mark completed with no values
     if (submissionStatus === 'PENDING_REVIEW' || submissionStatus === 'REVIEWED') {
       return 'COMPLETED';
     }
 
-    // Otherwise stage remains pending
     return 'PENDING';
   };
 
-  /**
-   * Formats ISO timestamp into readable date and time.
-   */
   const formatDate = (isoString: string): string => {
     try {
       const date = new Date(isoString);
@@ -372,11 +350,6 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
     }
   };
 
-  /**
-   * Card body press router:
-   * - If REVIEWED or PENDING_REVIEW: opens review verification editor.
-   * - If UPLOAD_PENDING: triggers submission upload.
-   */
   const handleCardPress = (item: SubmissionWithGuests) => {
     if (item.status === 'REVIEWED' || item.status === 'PENDING_REVIEW') {
       onOpenReview(item.id);
@@ -385,20 +358,17 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
     }
   };
 
-  /**
-   * Helper component rendering an individual stage badge pill.
-   */
   const renderStagePill = (label: string, stageStatus: StageStatus) => {
     let pillBg = colors.surfaceSubtle;
     let textColor = colors.textMuted;
     let statusText = 'Pending';
 
     if (stageStatus === 'COMPLETED') {
-      pillBg = colors.statusReady; // Turns Emerald Green when complete
+      pillBg = colors.statusReady;
       textColor = '#FFFFFF';
       statusText = 'Done ✓';
     } else if (stageStatus === 'PROCESSING') {
-      pillBg = colors.statusProcess; // Blue when actively processing
+      pillBg = colors.statusProcess;
       textColor = '#FFFFFF';
       statusText = 'Running ⏳';
     } else if (stageStatus === 'NOT_ATTACHED') {
@@ -416,9 +386,6 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
     );
   };
 
-  /**
-   * Renders each individual submission card with per-guest granular status strips.
-   */
   const renderSubmissionItem = ({ item }: { item: SubmissionWithGuests }) => {
     const badge = getStatusBadgeStyle(item.status);
     const isReadyForReview = item.status === 'PENDING_REVIEW';
@@ -426,7 +393,6 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
     const isUploadPending = item.status === 'UPLOAD_PENDING';
     const isProcessing = item.status === 'PROCESSING';
     const isThisCardActive = retryingId === item.id;
-    // Defensive check ensuring guests is always an array
     const guestList = Array.isArray(item.guests) ? item.guests : [];
 
     return (
@@ -439,7 +405,6 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
           },
         ]}
       >
-        {/* Card Header & Metadata (Tap to view/edit) */}
         <TouchableOpacity
           activeOpacity={0.7}
           onPress={() => handleCardPress(item)}
@@ -469,7 +434,7 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
           </View>
         </TouchableOpacity>
 
-        {/* Granular Per-Guest Service Pipeline Badges */}
+        {/* Per-Guest Stage Badges */}
         <View style={[styles.guestListContainer, { borderTopColor: colors.border }]}>
           {guestList.map((guest, idx) => {
             let extractedData: any = null;
@@ -481,7 +446,6 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
               }
             }
 
-            // Derive stage status for each service pipeline
             const passportStatus = evaluateServiceStage(
               item.status,
               extractedData,
@@ -523,7 +487,7 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
           })}
         </View>
 
-        {/* Submission-Level Action Footer */}
+        {/* Action Buttons */}
         <View style={[styles.cardFooterActions, { borderTopColor: colors.border }]}>
           {isThisCardActive ? (
             <View style={styles.centeredRow}>
@@ -545,7 +509,6 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
             </View>
           ) : isReadyForReview ? (
             <View style={styles.splitActionRow}>
-              {/* Submission-level Re-run */}
               <TouchableOpacity
                 onPress={() => handleTriggerReExtract(item)}
                 style={[styles.smallButton, { backgroundColor: colors.surfaceSubtle, borderColor: colors.border }]}
@@ -553,7 +516,6 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
                 <Text style={[styles.smallButtonText, { color: colors.textMuted }]}>⟳ Re-run All</Text>
               </TouchableOpacity>
 
-              {/* Primary button: Open review editor */}
               <TouchableOpacity
                 onPress={() => onOpenReview(item.id)}
                 style={[styles.smallButton, { backgroundColor: colors.statusReady, marginLeft: 8 }]}
@@ -565,7 +527,6 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
             </View>
           ) : isReviewed ? (
             <View style={styles.splitActionRow}>
-              {/* Submission-level Re-run */}
               <TouchableOpacity
                 onPress={() => handleTriggerReExtract(item)}
                 style={[styles.smallButton, { backgroundColor: colors.surfaceSubtle, borderColor: colors.border }]}
@@ -573,7 +534,6 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
                 <Text style={[styles.smallButtonText, { color: colors.textMuted }]}>⟳ Re-run All</Text>
               </TouchableOpacity>
 
-              {/* Edit button */}
               <TouchableOpacity
                 onPress={() => onOpenReview(item.id)}
                 style={[styles.smallButton, { backgroundColor: colors.surfaceSubtle, borderColor: colors.border, marginLeft: 8 }]}
@@ -581,7 +541,6 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
                 <Text style={[styles.smallButtonText, { color: colors.textPrimary }]}>✏️ Edit</Text>
               </TouchableOpacity>
 
-              {/* Open Form-C Portal Runner */}
               <TouchableOpacity
                 onPress={() => onOpenPortal(item.id)}
                 style={[styles.smallButton, { backgroundColor: colors.primaryBrand, marginLeft: 8 }]}
@@ -603,7 +562,6 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
 
   return (
     <View style={[styles.container, { backgroundColor: colors.background }]}>
-      {/* Top Navigation & App Bar */}
       <View
         style={[
           styles.topBar,
@@ -630,7 +588,6 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
         </View>
       </View>
 
-      {/* Main Queue List */}
       {loading ? (
         <View style={styles.centerContainer}>
           <ActivityIndicator size="large" color={colors.primaryBrand} />
@@ -660,7 +617,6 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
         />
       )}
 
-      {/* Floating Bottom Sticky Action Bar */}
       <View
         style={[
           styles.bottomBarContainer,
@@ -675,7 +631,6 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
         </TouchableOpacity>
       </View>
 
-      {/* Modal: Form-C Portal Credentials */}
       <Modal
         visible={isCredsModalVisible}
         transparent={true}
