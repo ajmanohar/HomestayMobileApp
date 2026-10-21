@@ -1,12 +1,14 @@
 // ==============================================================================
-// apiService.ts - HomestayMobileApp (React Native / Expo)
+// apiService.ts - HomestayMobileApp (React Native / Expo SDK 57)
 // ==============================================================================
 // Client networking service for dispatching document captures to the remote
-// Dell Micro edge server over Cloudflare Tunnel (https://api.theasymptotebrief.com)
+// Dell Micro edge server over Cloudflare Tunnel (https://api.theasymptotebrief.com).
 // Secured with pre-shared Bearer token authentication matching PassportReadAPI.
+// Uses expo-file-system/legacy to ensure FileSystemUploadType.MULTIPART compiles
+// cleanly on modern Expo SDK 57 without native FormDataPart bridge crashes.
 // ==============================================================================
 
-import * as FileSystem from 'expo-file-system';
+import * as FileSystem from 'expo-file-system/legacy';
 
 // ------------------------------------------------------------------------------
 // Configuration: Production endpoint and pre-shared Bearer Token
@@ -57,13 +59,14 @@ export interface JobStatusResponse {
  * Initializes a new document extraction job by uploading the primary passport bio image.
  * Maps to POST /api/v1/jobs/submit with multipart form data and Bearer Authorization.
  *
- * @param passportBioUri Local file URI for the captured passport bio page.
+ * @param passportBioUri - Local file URI for the captured passport bio page.
  * @returns Promise resolving to the created job identifier and initial status.
  */
 export const submitPassportBio = async (passportBioUri: string): Promise<CreateJobResponse> => {
+  // Construct absolute URL targeting the jobs submit endpoint
   const uploadUrl = `${API_BASE_URL}/jobs/submit`;
 
-  // Use Expo FileSystem to upload multipart file with Bearer Authorization header
+  // Use Expo FileSystem legacy engine to upload multipart file with Bearer Authorization header
   const uploadResult = await FileSystem.uploadAsync(uploadUrl, passportBioUri, {
     fieldName: 'passport_bio',
     httpMethod: 'POST',
@@ -73,10 +76,12 @@ export const submitPassportBio = async (passportBioUri: string): Promise<CreateJ
     },
   });
 
+  // Throw detailed exception if HTTP status indicates rejection
   if (uploadResult.status < 200 || uploadResult.status >= 300) {
     throw new Error(`Job submission failed with status ${uploadResult.status}: ${uploadResult.body}`);
   }
 
+  // Parse JSON response body into strongly-typed CreateJobResponse
   const parsedBody: CreateJobResponse = JSON.parse(uploadResult.body);
   return parsedBody;
 };
@@ -85,17 +90,19 @@ export const submitPassportBio = async (passportBioUri: string): Promise<CreateJ
  * Attaches a secondary document image to an existing background extraction job.
  * Maps to POST /api/v1/jobs/{job_id}/attach/{doc_type} with Bearer Authorization.
  *
- * @param jobId Unique job UUID returned from submitPassportBio.
- * @param docType Supported document type ('visa_page', 'entry_stamp', 'welcome_form', or 'guest_photo').
- * @param fileUri Local filesystem URI of the image to attach.
+ * @param jobId - Unique job UUID returned from submitPassportBio.
+ * @param docType - Supported document type ('visa_page', 'entry_stamp', 'welcome_form', or 'guest_photo').
+ * @param fileUri - Local filesystem URI of the image to attach.
  */
 export const attachDocumentToJob = async (
   jobId: string,
   docType: 'visa_page' | 'entry_stamp' | 'welcome_form' | 'guest_photo',
   fileUri: string
 ): Promise<void> => {
+  // Construct URL targeting the specific job attachment route
   const attachUrl = `${API_BASE_URL}/jobs/${jobId}/attach/${docType}`;
 
+  // Execute native multipart file upload via FileSystem legacy engine
   const uploadResult = await FileSystem.uploadAsync(attachUrl, fileUri, {
     fieldName: 'file',
     httpMethod: 'POST',
@@ -105,6 +112,7 @@ export const attachDocumentToJob = async (
     },
   });
 
+  // Verify attachment was accepted by the Dell server backend
   if (uploadResult.status < 200 || uploadResult.status >= 300) {
     throw new Error(`Failed to attach ${docType} to job ${jobId}: ${uploadResult.body}`);
   }
@@ -114,16 +122,19 @@ export const attachDocumentToJob = async (
  * Signals the server worker that all document uploads are complete and processing may begin.
  * Maps to POST /api/v1/jobs/{job_id}/start with Bearer Authorization.
  *
- * @param jobId Target job tracking UUID.
+ * @param jobId - Target job tracking UUID.
  */
 export const startJobProcessing = async (jobId: string): Promise<void> => {
+  // Construct URL targeting the worker initiation trigger
   const startUrl = `${API_BASE_URL}/jobs/${jobId}/start`;
 
+  // Issue HTTP POST request with authentication headers
   const response = await fetch(startUrl, {
     method: 'POST',
     headers: getAuthHeaders(),
   });
 
+  // Verify worker startup succeeded
   if (!response.ok) {
     const errorText = await response.text();
     throw new Error(`Failed to start job ${jobId} (HTTP ${response.status}): ${errorText}`);
@@ -134,22 +145,26 @@ export const startJobProcessing = async (jobId: string): Promise<void> => {
  * Polls the current state and partial/final extracted results of a specific job.
  * Maps to GET /api/v1/jobs/{job_id} with Bearer Authorization.
  *
- * @param jobId Unique job tracking UUID.
+ * @param jobId - Unique job tracking UUID.
  * @returns Promise resolving to the current job record including status and extracted fields.
  */
 export const getJobStatus = async (jobId: string): Promise<JobStatusResponse> => {
+  // Construct URL targeting the job inspection route
   const statusUrl = `${API_BASE_URL}/jobs/${jobId}`;
 
+  // Issue HTTP GET request with authentication headers
   const response = await fetch(statusUrl, {
     method: 'GET',
     headers: getAuthHeaders(),
   });
 
+  // Verify polling request succeeded
   if (!response.ok) {
     const errorText = await response.text();
     throw new Error(`Failed to fetch status for job ${jobId} (HTTP ${response.status}): ${errorText}`);
   }
 
+  // Parse and return JSON job status payload
   const data: JobStatusResponse = await response.json();
   return data;
 };
@@ -160,6 +175,7 @@ export const getJobStatus = async (jobId: string): Promise<JobStatusResponse> =>
  */
 export const checkApiHealth = async (): Promise<boolean> => {
   try {
+    // Target base server diagnostics route
     const healthUrl = `${API_BASE_URL.replace('/api/v1', '')}/health`;
     const response = await fetch(healthUrl, { method: 'GET' });
     return response.ok;
