@@ -1,19 +1,8 @@
 // ==============================================================================
 // ReviewScreen.tsx - HomestayMobileApp (React Native / Expo SDK 57)
 // ==============================================================================
-// Verification and review screen with pinch-to-zoom image inspection and
-// editable Form-C field inputs.
-//
-// Lifecycle Constraints (Task 43):
-// - Mobile application lifecycle ends strictly at Review & Re-submit.
-// - Portal auto-submission is removed from mobile.
-//
-// Features:
-// - Task 42: Dual Visa inspection tabs (e-Visa Document vs. Passport Visa Stamp).
-// - Task 44: Mobile-Triggered Deletion with cascade purge to Dell edge server.
-// - Task 45: Isolated per-document field viewing and editing.
-// - Task 48: Explicit (DD-MM-YYYY) labels on every date field and guaranteed
-//   persistence of manual operator overrides into SQLite.
+// Verification and review screen with fixed pinch-to-zoom image inspection,
+// manual 90° rotation, and editable Form-C field inputs.
 // ==============================================================================
 
 import React, { useState, useEffect, useCallback } from 'react';
@@ -30,6 +19,7 @@ import {
   SafeAreaView,
   Dimensions,
 } from 'react-native';
+import * as ImageManipulator from 'expo-image-manipulator';
 import { useAppTheme } from '../theme/ThemeContext';
 import {
   openDatabase,
@@ -51,7 +41,6 @@ interface ReviewScreenProps {
 type ActiveDocTab = 'passport' | 'visa_document' | 'visa_stamp' | 'stamp' | 'form_c' | 'photo' | 'all';
 
 interface FormCData {
-  // Bio fields
   surname: string;
   givenNames: string;
   sex: string;
@@ -59,19 +48,13 @@ interface FormCData {
   nationality: string;
   passportNumber: string;
   passportExpiryDate: string;
-
-  // Visa fields
   visaNumber: string;
   visaType: string;
   visaIssueDate: string;
   visaExpiryDate: string;
   visaPlaceOfIssue: string;
-
-  // Entry stamp fields
   arrivalDateIndia: string;
   arrivalPortIndia: string;
-
-  // Form-C slip fields (Rows 1-12)
   permanentAddress: string;
   city: string;
   country: string;
@@ -126,15 +109,16 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
   const [saving, setSaving] = useState<boolean>(false);
   const [reSubmitting, setReSubmitting] = useState<boolean>(false);
   const [deleting, setDeleting] = useState<boolean>(false);
+  const [rotating, setRotating] = useState<boolean>(false);
 
   const [submission, setSubmission] = useState<SubmissionRecord | null>(null);
   const [guestDoc, setGuestDoc] = useState<GuestDocumentRecord | null>(null);
   const [formData, setFormData] = useState<FormCData>(INITIAL_FORM_DATA);
   const [selectedDocTab, setSelectedDocTab] = useState<ActiveDocTab>('passport');
 
-  /**
-   * Helper function to extract text values whether flat or wrapped in { value, confidence }.
-   */
+  // Local state override for preview URI (supports real-time rotation in review)
+  const [customImageUris, setCustomImageUris] = useState<Record<string, string>>({});
+
   const extractVal = (field: any, fallback: string = ''): string => {
     if (field === null || field === undefined) return fallback;
     if (typeof field === 'object' && 'value' in field) {
@@ -143,9 +127,6 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
     return String(field);
   };
 
-  /**
-   * Loads submission metadata and guest documents from SQLite.
-   */
   const loadData = useCallback(async () => {
     try {
       setLoading(true);
@@ -165,8 +146,6 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
         if (doc.extracted_data_json) {
           try {
             const parsed = JSON.parse(doc.extracted_data_json);
-
-            // Check if backend returned isolated containers (Task 45) or flat structure
             const docsContainer = parsed.documents || {};
             const pBio = docsContainer.passport_bio || parsed;
             const vDoc = docsContainer.visa_document || parsed;
@@ -175,7 +154,6 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
             const wForm = docsContainer.welcome_form || parsed;
 
             setFormData({
-              // Passport Bio
               surname: extractVal(pBio.surname),
               givenNames: extractVal(pBio.given_names),
               sex: extractVal(pBio.sex),
@@ -183,19 +161,13 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
               nationality: extractVal(pBio.nationality),
               passportNumber: extractVal(pBio.passport_number),
               passportExpiryDate: extractVal(pBio.passport_expiry_date),
-
-              // Visa (prefer visa_document then visa_stamp then flat)
               visaNumber: extractVal(vDoc.visa_number || vStamp.visa_number || parsed.visa_number),
               visaType: extractVal(vDoc.visa_type || vStamp.visa_type || parsed.visa_type, 'TOURIST'),
               visaIssueDate: extractVal(vDoc.visa_issue_date || vStamp.visa_issue_date || parsed.visa_issue_date),
               visaExpiryDate: extractVal(vDoc.visa_expiry_date || vStamp.visa_expiry_date || parsed.visa_expiry_date),
               visaPlaceOfIssue: extractVal(vDoc.visa_place_of_issue || vStamp.visa_place_of_issue || parsed.visa_place_of_issue),
-
-              // Entry Stamp
               arrivalDateIndia: extractVal(eStamp.arrival_date_india || parsed.arrival_date_india),
               arrivalPortIndia: extractVal(eStamp.arrival_port_india || parsed.arrival_port_india),
-
-              // Form-C Report (Rows 1-12)
               permanentAddress: extractVal(wForm.permanent_address || parsed.permanent_address),
               city: extractVal(wForm.city || parsed.city),
               country: extractVal(wForm.country || parsed.country),
@@ -226,10 +198,10 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
     loadData();
   }, [loadData]);
 
-  /**
-   * Resolves the active image URI based on the selected document tab.
-   */
   const getActiveImageUri = (): string | null => {
+    if (customImageUris[selectedDocTab]) {
+      return customImageUris[selectedDocTab];
+    }
     if (!guestDoc) return null;
     switch (selectedDocTab) {
       case 'passport':
@@ -251,15 +223,35 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
   };
 
   /**
-   * Updates an individual field value in the local state.
+   * Task 51: Rotates active document preview image by 90 degrees in review.
    */
+  const handleRotateCurrentDoc = async () => {
+    const currentUri = getActiveImageUri();
+    if (!currentUri) return;
+
+    try {
+      setRotating(true);
+      const manipResult = await ImageManipulator.manipulateAsync(
+        currentUri,
+        [{ rotate: 90 }],
+        { compress: 0.85, format: ImageManipulator.SaveFormat.JPEG }
+      );
+
+      setCustomImageUris((prev) => ({
+        ...prev,
+        [selectedDocTab]: manipResult.uri,
+      }));
+    } catch (err: any) {
+      Alert.alert('Rotation Error', err.message || 'Could not rotate image.');
+    } finally {
+      setRotating(false);
+    }
+  };
+
   const updateField = (key: keyof FormCData, value: string) => {
     setFormData((prev) => ({ ...prev, [key]: value }));
   };
 
-  /**
-   * Task 48: Overwrites AI data with manual operator edits and persists to SQLite.
-   */
   const handleSave = async (showNotice: boolean = true) => {
     try {
       setSaving(true);
@@ -290,7 +282,6 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
         purpose_of_visit: { value: formData.purposeOfVisit, confidence: 1.0, source: 'manual_edit' },
         expected_departure_date: { value: formData.expectedDepartureDate, confidence: 1.0, source: 'manual_edit' },
         arrived_country_city_india: { value: formData.arrivedCountryCityIndia, confidence: 1.0, source: 'manual_edit' },
-        // Maintain per-document container structure with manual overrides
         documents: {
           passport_bio: {
             surname: { value: formData.surname, confidence: 1.0, source: 'manual_edit' },
@@ -333,7 +324,7 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
       await updateSubmissionStatus(submissionId, 'REVIEWED');
 
       if (showNotice) {
-        Alert.alert('Saved', 'Guest Form-C details successfully updated locally and ready for desktop retrieval.');
+        Alert.alert('Saved', 'Guest Form-C details successfully updated locally.');
       }
     } catch (err: any) {
       Alert.alert('Save Failed', err.message || 'Could not save guest record.');
@@ -342,9 +333,6 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
     }
   };
 
-  /**
-   * Re-submits images to the Dell server for fresh background extraction.
-   */
   const handleReSubmit = async () => {
     if (!guestDoc || !guestDoc.passport_bio_path) {
       Alert.alert('Error', 'Passport bio image is required to initiate extraction.');
@@ -353,24 +341,23 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
 
     try {
       setReSubmitting(true);
-      const submitRes = await submitPassportBio(guestDoc.passport_bio_path);
+      const submitRes = await submitPassportBio(customImageUris['passport'] || guestDoc.passport_bio_path);
       const newJobId = submitRes.job_id;
 
-      if (guestDoc.visa_document_path) {
-        await attachDocumentToJob(newJobId, 'visa_document', guestDoc.visa_document_path);
-      }
-      if (guestDoc.visa_stamp_path) {
-        await attachDocumentToJob(newJobId, 'visa_stamp', guestDoc.visa_stamp_path);
-      }
-      if (guestDoc.entry_stamp_path) {
-        await attachDocumentToJob(newJobId, 'entry_stamp', guestDoc.entry_stamp_path);
-      }
-      if (guestDoc.form_c_path) {
-        await attachDocumentToJob(newJobId, 'welcome_form', guestDoc.form_c_path);
-      }
-      if (guestDoc.guest_photo_path) {
-        await attachDocumentToJob(newJobId, 'guest_photo', guestDoc.guest_photo_path);
-      }
+      const vPath = customImageUris['visa_document'] || guestDoc.visa_document_path;
+      if (vPath) await attachDocumentToJob(newJobId, 'visa_document', vPath);
+
+      const vsPath = customImageUris['visa_stamp'] || guestDoc.visa_stamp_path;
+      if (vsPath) await attachDocumentToJob(newJobId, 'visa_stamp', vsPath);
+
+      const sPath = customImageUris['stamp'] || guestDoc.entry_stamp_path;
+      if (sPath) await attachDocumentToJob(newJobId, 'entry_stamp', sPath);
+
+      const fPath = customImageUris['form_c'] || guestDoc.form_c_path;
+      if (fPath) await attachDocumentToJob(newJobId, 'welcome_form', fPath);
+
+      const pPath = customImageUris['photo'] || guestDoc.guest_photo_path;
+      if (pPath) await attachDocumentToJob(newJobId, 'guest_photo', pPath);
 
       await startJobProcessing(newJobId);
 
@@ -396,13 +383,10 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
     }
   };
 
-  /**
-   * Permanently deletes submission on mobile and cascades purge on Dell edge server (Task 44).
-   */
   const handleDeleteSubmission = () => {
     Alert.alert(
       'Delete Submission',
-      'Are you sure you want to delete this submission? All captured images and extracted records will be permanently removed from this device and the server.',
+      'Are you sure you want to delete this submission? All captured images and extracted records will be permanently removed.',
       [
         { text: 'Cancel', style: 'cancel' },
         {
@@ -426,15 +410,11 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
     );
   };
 
-  /**
-   * Concludes the mobile lifecycle (Task 43: Review & Re-submit only).
-   */
   const handleCompleteReview = async () => {
     await handleSave(false);
     onComplete();
   };
 
-  // Helper to render an outlined editable text input with explicit format hints
   const renderField = (label: string, fieldKey: keyof FormCData, placeholder: string = '') => (
     <View style={styles.fieldContainer} key={fieldKey}>
       <Text style={[styles.fieldLabel, { color: colors.textMuted }]}>{label}</Text>
@@ -468,7 +448,7 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
 
   return (
     <SafeAreaView style={[styles.container, { backgroundColor: colors.background }]}>
-      {/* --- Header Bar --- */}
+      {/* Header Bar */}
       <View style={[styles.header, { borderBottomColor: colors.border }]}>
         <TouchableOpacity onPress={onBack} style={styles.backButton}>
           <Text style={[styles.backButtonText, { color: colors.primaryBrand }]}>← Back</Text>
@@ -487,7 +467,7 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
         </TouchableOpacity>
       </View>
 
-      {/* --- Top 38%: Pinch-to-Zoom Document Preview --- */}
+      {/* --- Fixed Pinch-to-Zoom Document Preview Pane --- */}
       <View style={[styles.imageViewerPane, { backgroundColor: isDark ? '#000000' : '#F1F5F9' }]}>
         {activeImageUri ? (
           <ScrollView
@@ -497,7 +477,9 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
             showsVerticalScrollIndicator={false}
             contentContainerStyle={styles.zoomContent}
           >
-            <Image source={{ uri: activeImageUri }} style={styles.previewImage} resizeMode="contain" />
+            <View style={styles.zoomableImageWrapper}>
+              <Image source={{ uri: activeImageUri }} style={styles.previewImage} resizeMode="contain" />
+            </View>
           </ScrollView>
         ) : (
           <View style={styles.noImagePlaceholder}>
@@ -509,9 +491,24 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
         <View style={styles.zoomHintBadge}>
           <Text style={styles.zoomHintText}>🔍 Pinch to zoom</Text>
         </View>
+
+        {/* Task 51: Rotate Button for Active Document Tab */}
+        {activeImageUri && (
+          <TouchableOpacity
+            disabled={rotating}
+            onPress={handleRotateCurrentDoc}
+            style={styles.floatingRotateButton}
+          >
+            {rotating ? (
+              <ActivityIndicator size="small" color="#FFFFFF" />
+            ) : (
+              <Text style={styles.floatingRotateText}>⟳ Rotate 90°</Text>
+            )}
+          </TouchableOpacity>
+        )}
       </View>
 
-      {/* --- Document Selector Tabs (Task 42: Dual Visa Support) --- */}
+      {/* Document Selector Tabs */}
       <ScrollView
         horizontal
         showsHorizontalScrollIndicator={false}
@@ -577,66 +574,62 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
         </TouchableOpacity>
       </ScrollView>
 
-      {/* --- Bottom 60%: Tab-Scoped Editable Form Fields with Explicit Date Labels (Task 48) --- */}
+      {/* Bottom Form Fields */}
       <ScrollView style={styles.fieldsScroll} contentContainerStyle={styles.fieldsContainer}>
-        {/* PASSPORT FIELDS */}
         {(selectedDocTab === 'passport' || selectedDocTab === 'all') && (
           <View style={styles.formSection}>
             <Text style={[styles.sectionHeading, { color: colors.primaryBrand }]}>Passport Bio-Data</Text>
-            {renderField('Surname (Family Name)', 'surname', 'e.g. DOE')}
-            {renderField('Given Name(s)', 'givenNames', 'e.g. JOHN')}
-            {renderField('Passport Number', 'passportNumber', 'e.g. C92PJR1W2')}
-            {renderField('Nationality', 'nationality', 'e.g. DEUTSCH or GERMANY')}
-            {renderField('Date of Birth (DD-MM-YYYY)', 'dateOfBirth', 'DD-MM-YYYY')}
-            {renderField('Sex (M / F / X)', 'sex', 'M, F, or X')}
-            {renderField('Passport Expiry Date (DD-MM-YYYY)', 'passportExpiryDate', 'DD-MM-YYYY')}
+            {renderField('Surname (Family Name)', 'surname')}
+            {renderField('Given Name(s)', 'givenNames')}
+            {renderField('Passport Number', 'passportNumber')}
+            {renderField('Nationality', 'nationality')}
+            {renderField('Date of Birth (DD-MM-YYYY)', 'dateOfBirth')}
+            {renderField('Sex (M / F / X)', 'sex')}
+            {renderField('Passport Expiry Date (DD-MM-YYYY)', 'passportExpiryDate')}
           </View>
         )}
 
-        {/* VISA FIELDS (Task 42) */}
         {(selectedDocTab === 'visa_document' || selectedDocTab === 'visa_stamp' || selectedDocTab === 'all') && (
           <View style={styles.formSection}>
             <Text style={[styles.sectionHeading, { color: colors.primaryBrand }]}>
-              {selectedDocTab === 'visa_document' ? 'e-Visa Document Details' : 'Visa Stamp / Sticker Details'}
+              {selectedDocTab === 'visa_document' ? 'e-Visa Document Details' : 'Visa Stamp Details'}
             </Text>
-            {renderField('Visa Number', 'visaNumber', 'e.g. H26V04876')}
-            {renderField('Visa Type', 'visaType', 'TOURIST, BUSINESS, etc.')}
-            {renderField('Visa Issue Date (DD-MM-YYYY)', 'visaIssueDate', 'DD-MM-YYYY')}
-            {renderField('Visa Expiry Date (DD-MM-YYYY)', 'visaExpiryDate', 'DD-MM-YYYY')}
-            {renderField('Place of Issue / Authority', 'visaPlaceOfIssue', 'e.g. Berlin or Online')}
+            {renderField('Visa Number', 'visaNumber')}
+            {renderField('Visa Type', 'visaType')}
+            {renderField('Issue Date (DD-MM-YYYY)', 'visaIssueDate')}
+            {renderField('Expiry Date (DD-MM-YYYY)', 'visaExpiryDate')}
+            {renderField('Place of Issue / Authority', 'visaPlaceOfIssue')}
           </View>
         )}
 
-        {/* ENTRY STAMP FIELDS */}
         {(selectedDocTab === 'stamp' || selectedDocTab === 'all') && (
           <View style={styles.formSection}>
             <Text style={[styles.sectionHeading, { color: colors.primaryBrand }]}>Immigration Arrival Stamp</Text>
-            {renderField('Date of Arrival in India (DD-MM-YYYY)', 'arrivalDateIndia', 'DD-MM-YYYY')}
-            {renderField('Port or Airport of Arrival', 'arrivalPortIndia', 'e.g. COCHIN AIRPORT, MUMBAI')}
+            {renderField('Date of Arrival in India (DD-MM-YYYY)', 'arrivalDateIndia')}
+            {renderField('Port or Airport of Arrival', 'arrivalPortIndia')}
           </View>
         )}
 
-        {/* FORM-C HANDWRITTEN SLIP FIELDS (Rows 1-12) */}
         {(selectedDocTab === 'form_c' || selectedDocTab === 'all') && (
           <View style={styles.formSection}>
             <Text style={[styles.sectionHeading, { color: colors.primaryBrand }]}>Form-C Arrival Report (Rows 1-12)</Text>
-            {renderField('Row 2: Full Permanent Street Address', 'permanentAddress', 'Street address in home country')}
-            {renderField('Row 2: Home City / Town', 'city', 'Foreign city')}
-            {renderField('Row 2: Home Country', 'country', 'Foreign country')}
-            {renderField('Row 2: Contact Email', 'contactEmail', 'guest@example.com')}
-            {renderField('Row 2: Telephone / Mobile', 'contactPhone', '+49 ...')}
-            {renderField('Row 6: Date & Time of Arrival in Homestay (DD-MM-YYYY HH:MM)', 'arrivalDatetimeHomestay', 'DD-MM-YYYY HH:MM')}
-            {renderField('Row 7: Arrived From', 'arrivedFrom', 'Previous city / country')}
-            {renderField('Row 8: Proceeding To', 'proceedingTo', 'Next destination')}
-            {renderField('Row 9: Proposed Stay Duration in India', 'stayDurationIndia', 'e.g. 1 month, 2 weeks')}
-            {renderField('Row 10: Purpose of Visit & Profession', 'purposeOfVisit', 'Tourist, Business, etc.')}
-            {renderField('Row 11: Expected Date of Departure (DD-MM-YYYY)', 'expectedDepartureDate', 'DD-MM-YYYY')}
-            {renderField('Row 12: Country & City Arrived to India', 'arrivedCountryCityIndia', 'e.g. Germany, Munich')}
+            {renderField('Row 2: Full Permanent Street Address', 'permanentAddress')}
+            {renderField('Row 2: Home City / Town', 'city')}
+            {renderField('Row 2: Home Country', 'country')}
+            {renderField('Row 2: Contact Email', 'contactEmail')}
+            {renderField('Row 2: Telephone / Mobile', 'contactPhone')}
+            {renderField('Row 6: Date & Time of Arrival in Homestay (DD-MM-YYYY HH:MM)', 'arrivalDatetimeHomestay')}
+            {renderField('Row 7: Arrived From', 'arrivedFrom')}
+            {renderField('Row 8: Proceeding To', 'proceedingTo')}
+            {renderField('Row 9: Proposed Stay Duration in India', 'stayDurationIndia')}
+            {renderField('Row 10: Purpose of Visit & Profession', 'purposeOfVisit')}
+            {renderField('Row 11: Expected Date of Departure (DD-MM-YYYY)', 'expectedDepartureDate')}
+            {renderField('Row 12: Country & City Arrived to India', 'arrivedCountryCityIndia')}
           </View>
         )}
       </ScrollView>
 
-      {/* --- Action Bar (Task 43: Review & Re-Submit Only - Portal Submit Removed) --- */}
+      {/* Action Bar */}
       <View style={[styles.actionBar, { borderTopColor: colors.border, backgroundColor: colors.background }]}>
         <TouchableOpacity
           style={[styles.reSubmitButton, { borderColor: colors.primaryBrand }]}
@@ -725,8 +718,14 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     alignItems: 'center',
   },
-  previewImage: {
+  zoomableImageWrapper: {
     width: Dimensions.get('window').width,
+    height: Dimensions.get('window').height * 0.38,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  previewImage: {
+    width: '100%',
     height: '100%',
   },
   noImagePlaceholder: {
@@ -747,11 +746,27 @@ const styles = StyleSheet.create({
     paddingHorizontal: 8,
     paddingVertical: 4,
     borderRadius: 6,
+    zIndex: 10,
   },
   zoomHintText: {
     color: '#FFFFFF',
     fontSize: 11,
     fontWeight: '500',
+  },
+  floatingRotateButton: {
+    position: 'absolute',
+    bottom: 8,
+    left: 12,
+    backgroundColor: 'rgba(0,0,0,0.75)',
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 6,
+    zIndex: 10,
+  },
+  floatingRotateText: {
+    color: '#FFFFFF',
+    fontSize: 12,
+    fontWeight: '700',
   },
   tabsBar: {
     maxHeight: 48,

@@ -1,3 +1,18 @@
+// ==============================================================================
+// CaptureScreen.tsx - HomestayMobileApp (React Native / Expo SDK 57)
+// ==============================================================================
+// 5-Step guided camera capture workflow for guest identity documents:
+// 1. Passport Bio-Data Page
+// 2. Visa Page or OCI Card
+// 3. Entry Immigration Stamp
+// 4. Handwritten Form-C Arrival Report
+// 5. Dedicated Guest Portrait Photo
+//
+// Features:
+// - On-device 1280px proportional downscaling & JPEG compression.
+// - Task 51: Manual 90° rotation control allowing operators to upright photos before saving.
+// ==============================================================================
+
 import React, { useState } from 'react';
 import {
   View,
@@ -17,14 +32,6 @@ import { useAppTheme } from '../theme/ThemeContext';
 import { insertSubmission, SubmissionRecord, GuestDocumentRecord } from '../db/database';
 import { syncPendingUploads } from '../services/syncManager';
 
-/**
- * Metadata definition for each of the 5 required capture steps:
- * 1. Passport Bio-Data Page
- * 2. Visa Page or OCI Card
- * 3. Entry Immigration Stamp
- * 4. Handwritten Form-C Arrival Report
- * 5. Dedicated Guest Portrait Photo
- */
 interface DocumentStep {
   key: 'passport' | 'visa' | 'stamp' | 'form_c' | 'guest_photo';
   title: string;
@@ -65,10 +72,8 @@ interface CaptureScreenProps {
 }
 
 export const CaptureScreen: React.FC<CaptureScreenProps> = ({ onCaptureComplete, onCancel }) => {
-  // Theme context providing dynamic color tokens
   const { colors, isDark, toggleTheme } = useAppTheme();
 
-  // Ingestion form state
   const [reference, setReference] = useState('');
   const [currentStepIndex, setCurrentStepIndex] = useState(0);
   const [capturedImages, setCapturedImages] = useState<Record<string, string>>({});
@@ -81,36 +86,50 @@ export const CaptureScreen: React.FC<CaptureScreenProps> = ({ onCaptureComplete,
   /**
    * Optimizes captured camera image on-device:
    * - Downscales long edge to 1280px maintaining aspect ratio.
-   * - Compresses to JPEG 82% quality (preserves sharp OCR text while dropping size from ~8MB to ~400KB).
-   * - Validates legibility bounds.
+   * - Compresses to JPEG 82% quality.
    */
   const optimizeDocumentImage = async (rawUri: string): Promise<string> => {
     try {
       console.log(`[CaptureScreen] Optimizing image on device: ${rawUri}`);
       
-      // Resize proportionally so maximum width is 1280px
       const manipResult = await ImageManipulator.manipulateAsync(
         rawUri,
         [{ resize: { width: 1280 } }],
         { compress: 0.82, format: ImageManipulator.SaveFormat.JPEG }
       );
 
-      // Pre-flight legibility validation: check dimensions
-      if (manipResult.width < 600 || manipResult.height < 400) {
-        console.warn(`[CaptureScreen] Image resolution unusually low: ${manipResult.width}x${manipResult.height}`);
-      } else {
-        console.log(`[CaptureScreen] Optimized to ${manipResult.width}x${manipResult.height} successfully.`);
-      }
-
       return manipResult.uri;
     } catch (err) {
-      console.warn('[CaptureScreen] Optimization fallback: using raw URI due to error:', err);
+      console.warn('[CaptureScreen] Optimization fallback: using raw URI:', err);
       return rawUri;
     }
   };
 
   /**
-   * Launches the device camera, then immediately compresses and optimizes the image.
+   * Task 51: Rotates the active preview image 90 degrees clockwise.
+   */
+  const handleRotate90 = async () => {
+    if (!activeImageUri) return;
+    try {
+      setIsProcessingImage(true);
+      const manipResult = await ImageManipulator.manipulateAsync(
+        activeImageUri,
+        [{ rotate: 90 }],
+        { compress: 0.85, format: ImageManipulator.SaveFormat.JPEG }
+      );
+      setCapturedImages((prev) => ({
+        ...prev,
+        [activeStep.key]: manipResult.uri,
+      }));
+    } catch (err: any) {
+      Alert.alert('Rotation Error', err.message || 'Failed to rotate image.');
+    } finally {
+      setIsProcessingImage(false);
+    }
+  };
+
+  /**
+   * Launches the device camera, then optimizes the image.
    */
   const handleTakePhoto = async () => {
     const permissionResult = await ImagePicker.requestCameraPermissionsAsync();
@@ -130,7 +149,6 @@ export const CaptureScreen: React.FC<CaptureScreenProps> = ({ onCaptureComplete,
       const selectedUri = result.assets[0].uri;
       try {
         setIsProcessingImage(true);
-        // Optimize on-device before preview and save
         const optimizedUri = await optimizeDocumentImage(selectedUri);
         setCapturedImages((prev) => ({
           ...prev,
@@ -143,8 +161,7 @@ export const CaptureScreen: React.FC<CaptureScreenProps> = ({ onCaptureComplete,
   };
 
   /**
-   * Copies captured images to permanent internal storage and creates
-   * a local SQLite record in 'UPLOAD_PENDING' state.
+   * Finalizes submission and persists to local SQLite database.
    */
   const handleFinalizeSubmission = async () => {
     if (!capturedImages['passport']) {
@@ -158,11 +175,9 @@ export const CaptureScreen: React.FC<CaptureScreenProps> = ({ onCaptureComplete,
       const docRecordId = `doc_${Date.now()}`;
       const now = new Date().toISOString();
 
-      // Permanent directory inside app internal storage
       const docDir = `${FileSystem.documentDirectory}documents/${submissionId}/`;
       await FileSystem.makeDirectoryAsync(docDir, { intermediates: true });
 
-      // Copy each optimized image to internal storage to ensure offline permanence
       const persistedPaths: Record<string, string> = {};
       for (const [key, uri] of Object.entries(capturedImages)) {
         const destUri = `${docDir}${key}.jpg`;
@@ -170,7 +185,6 @@ export const CaptureScreen: React.FC<CaptureScreenProps> = ({ onCaptureComplete,
         persistedPaths[key] = destUri;
       }
 
-      // Prepare Submission entity
       const newSubmission: SubmissionRecord = {
         id: submissionId,
         reference: reference.trim().length > 0 ? reference.trim() : undefined,
@@ -180,7 +194,6 @@ export const CaptureScreen: React.FC<CaptureScreenProps> = ({ onCaptureComplete,
         updated_at: now,
       };
 
-      // Prepare GuestDocument entity including local guest_photo_path
       const newGuestDoc: GuestDocumentRecord = {
         id: docRecordId,
         submission_id: submissionId,
@@ -192,10 +205,8 @@ export const CaptureScreen: React.FC<CaptureScreenProps> = ({ onCaptureComplete,
         guest_photo_path: persistedPaths['guest_photo'],
       };
 
-      // 1. Insert into local SQLite database
       await insertSubmission(newSubmission, [newGuestDoc]);
 
-      // 2. Trigger detached background upload for documents without blocking UI
       syncPendingUploads().catch((err) =>
         console.warn('[CaptureScreen] Detached sync triggered with error:', err)
       );
@@ -210,7 +221,7 @@ export const CaptureScreen: React.FC<CaptureScreenProps> = ({ onCaptureComplete,
 
   return (
     <View style={[styles.container, { backgroundColor: colors.background }]}>
-      {/* Top Header Bar */}
+      {/* Header Bar */}
       <View style={[styles.headerBar, { backgroundColor: colors.surface, borderBottomColor: colors.border }]}>
         <TouchableOpacity onPress={onCancel} style={styles.headerButton}>
           <Text style={[styles.headerButtonText, { color: colors.textMuted }]}>Cancel</Text>
@@ -222,7 +233,7 @@ export const CaptureScreen: React.FC<CaptureScreenProps> = ({ onCaptureComplete,
       </View>
 
       <ScrollView contentContainerStyle={styles.scrollContent}>
-        {/* Optional Booking Reference Input */}
+        {/* Booking Reference Input */}
         <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}>
           <Text style={[styles.fieldLabel, { color: colors.textPrimary }]}>
             Guest Name or Booking Reference (Optional)
@@ -243,7 +254,7 @@ export const CaptureScreen: React.FC<CaptureScreenProps> = ({ onCaptureComplete,
           />
         </View>
 
-        {/* Guided Step Indicator (1 to 5) */}
+        {/* Guided Step Indicator */}
         <View style={styles.stepIndicatorContainer}>
           {DOCUMENT_STEPS.map((step, idx) => {
             const isCompleted = !!capturedImages[step.key];
@@ -295,7 +306,7 @@ export const CaptureScreen: React.FC<CaptureScreenProps> = ({ onCaptureComplete,
               <View style={styles.emptyPreview}>
                 <ActivityIndicator size="large" color={colors.primaryBrand} />
                 <Text style={[styles.emptyPreviewText, { color: colors.textMuted, marginTop: 8 }]}>
-                  Optimizing image clarity...
+                  Processing image...
                 </Text>
               </View>
             ) : activeImageUri ? (
@@ -303,19 +314,30 @@ export const CaptureScreen: React.FC<CaptureScreenProps> = ({ onCaptureComplete,
             ) : (
               <View style={styles.emptyPreview}>
                 <Text style={[styles.emptyPreviewText, { color: colors.textMuted }]}>
-                  {activeStep.key === 'guest_photo'
-                    ? 'No guest portrait captured yet'
-                    : 'No document captured yet'}
+                  No document captured yet
                 </Text>
               </View>
             )}
           </View>
 
+          {/* Task 51: Rotate 90° Button (Visible when image is captured) */}
+          {activeImageUri && (
+            <TouchableOpacity
+              disabled={isProcessingImage}
+              onPress={handleRotate90}
+              style={[styles.rotateButton, { backgroundColor: colors.surfaceSubtle, borderColor: colors.border }]}
+            >
+              <Text style={[styles.rotateButtonText, { color: colors.textPrimary }]}>
+                ⟳ Rotate 90° Clockwise
+              </Text>
+            </TouchableOpacity>
+          )}
+
           {/* Shutter / Retake Button */}
           <TouchableOpacity
             disabled={isProcessingImage}
             onPress={handleTakePhoto}
-            style={[styles.cameraButton, { backgroundColor: colors.accent }]}
+            style={[styles.cameraButton, { backgroundColor: colors.accent, marginTop: activeImageUri ? 10 : 0 }]}
           >
             <Text style={styles.cameraButtonText}>
               {activeImageUri ? 'Retake Photo' : 'Snap Photo'}
@@ -451,7 +473,7 @@ const styles = StyleSheet.create({
     overflow: 'hidden',
     alignItems: 'center',
     justifyContent: 'center',
-    marginBottom: 16,
+    marginBottom: 12,
   },
   previewImage: {
     width: '100%',
@@ -463,6 +485,18 @@ const styles = StyleSheet.create({
   },
   emptyPreviewText: {
     fontSize: 14,
+  },
+  rotateButton: {
+    height: 40,
+    borderRadius: 8,
+    borderWidth: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 10,
+  },
+  rotateButtonText: {
+    fontSize: 13,
+    fontWeight: '600',
   },
   cameraButton: {
     height: 48,
