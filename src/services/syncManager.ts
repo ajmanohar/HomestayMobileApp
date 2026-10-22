@@ -17,7 +17,7 @@ import { submitGuestDocuments, pollJobStatus } from './apiService';
  * Helper to safely extract the extraction payload dictionary
  * across various possible backend response wrappers.
  *
- * @param statusResponse - Raw JSON payload returned from the backend status endpoint.
+ * @param statusResponse Raw JSON payload returned from the backend status endpoint.
  * @returns Parsed extraction dictionary or null.
  */
 const extractDataPayload = (statusResponse: any): any => {
@@ -42,10 +42,10 @@ const extractDataPayload = (statusResponse: any): any => {
  * Progressively persists partial extraction snapshots into SQLite while still PROCESSING,
  * allowing the Dashboard stage badges (Passport, Visa, Stamp, Form-C) to turn green in real time.
  *
- * @param submissionId - Local SQLite primary key for the submission
- * @param jobId - UUID assigned by the backend extraction pipeline
- * @param maxAttempts - Maximum polling iterations (default: 45)
- * @param delayMs - Interval between poll queries in milliseconds (default: 4000ms = 4s)
+ * @param submissionId Local SQLite primary key for the submission
+ * @param jobId UUID assigned by the backend extraction pipeline
+ * @param maxAttempts Maximum polling iterations (default: 45)
+ * @param delayMs Interval between poll queries in milliseconds (default: 4000ms = 4s)
  */
 export const pollJobUntilComplete = async (
   submissionId: string,
@@ -164,7 +164,7 @@ export const syncPendingUploads = async (): Promise<void> => {
         guestDoc.visa_stamp_path ?? undefined,
         guestDoc.entry_stamp_path ?? undefined,
         guestDoc.form_c_path ?? undefined,
-        submission.reference
+        submission.reference ?? undefined
       );
 
       console.log(`[SyncManager] Upload succeeded. Server Job ID: ${response.job_id}`);
