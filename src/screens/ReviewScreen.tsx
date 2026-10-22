@@ -1,8 +1,12 @@
 // ==============================================================================
 // ReviewScreen.tsx - HomestayMobileApp (React Native / Expo SDK 57)
 // ==============================================================================
-// Verification and review screen with fixed pinch-to-zoom image inspection,
-// manual 90° rotation, and editable Form-C field inputs.
+// Document review and verification screen:
+// - Task 53: Permanent rotation persistence (saving rotated JPEG directly into 
+//   persistent app storage and updating SQLite `guest_documents` immediately).
+// - Task 53: Android & iOS compatible document zoom/pan viewer with manual zoom controls.
+// - Re-submits rotated images directly to Dell edge server.
+// - Dynamic Form-C Rule 14 editable field sections by document tab.
 // ==============================================================================
 
 import React, { useState, useEffect, useCallback } from 'react';
@@ -20,6 +24,7 @@ import {
   Dimensions,
 } from 'react-native';
 import * as ImageManipulator from 'expo-image-manipulator';
+import * as FileSystem from 'expo-file-system/legacy';
 import { useAppTheme } from '../theme/ThemeContext';
 import {
   openDatabase,
@@ -116,8 +121,8 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
   const [formData, setFormData] = useState<FormCData>(INITIAL_FORM_DATA);
   const [selectedDocTab, setSelectedDocTab] = useState<ActiveDocTab>('passport');
 
-  // Local state override for preview URI (supports real-time rotation in review)
-  const [customImageUris, setCustomImageUris] = useState<Record<string, string>>({});
+  // Zoom scale state for interactive document viewing (1.0 = normal, up to 3.5x)
+  const [zoomScale, setZoomScale] = useState<number>(1.0);
 
   const extractVal = (field: any, fallback: string = ''): string => {
     if (field === null || field === undefined) return fallback;
@@ -175,11 +180,11 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
               contactPhone: extractVal(wForm.contact_phone || parsed.contact_phone),
               arrivalDatetimeHomestay: extractVal(wForm.arrival_datetime_homestay || parsed.arrival_datetime_homestay),
               arrivedFrom: extractVal(wForm.arrived_from || parsed.arrived_from),
-              proceedingTo: extractVal(wForm.proceeding_to || parsed.proceeding_to),
-              stayDurationIndia: extractVal(wForm.stay_duration_india || parsed.stay_duration_india),
-              purposeOfVisit: extractVal(wForm.purpose_of_visit || parsed.purpose_of_visit, 'Tourist'),
-              expectedDepartureDate: extractVal(wForm.expected_departure_date || parsed.expected_departure_date),
-              arrivedCountryCityIndia: extractVal(wForm.arrived_country_city_india || parsed.arrived_country_city_india),
+              proceedingTo: extractVal(wForm.proceeding_to || parsed.proceedingTo),
+              stayDurationIndia: extractVal(wForm.stay_duration_india || parsed.stayDurationIndia),
+              purposeOfVisit: extractVal(wForm.purpose_of_visit || parsed.purposeOfVisit, 'Tourist'),
+              expectedDepartureDate: extractVal(wForm.expected_departure_date || parsed.expectedDepartureDate),
+              arrivedCountryCityIndia: extractVal(wForm.arrived_country_city_india || parsed.arrivedCountryCityIndia),
             });
           } catch (jsonErr) {
             console.warn('[ReviewScreen] Error parsing extracted_data_json:', jsonErr);
@@ -198,10 +203,12 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
     loadData();
   }, [loadData]);
 
+  // Reset zoom scale when user switches tabs
+  useEffect(() => {
+    setZoomScale(1.0);
+  }, [selectedDocTab]);
+
   const getActiveImageUri = (): string | null => {
-    if (customImageUris[selectedDocTab]) {
-      return customImageUris[selectedDocTab];
-    }
     if (!guestDoc) return null;
     switch (selectedDocTab) {
       case 'passport':
@@ -223,29 +230,77 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
   };
 
   /**
-   * Task 51: Rotates active document preview image by 90 degrees in review.
+   * Task 53: Rotates the active document by 90 degrees, permanently writes
+   * the rotated file to internal disk storage, and updates SQLite immediately.
    */
   const handleRotateCurrentDoc = async () => {
     const currentUri = getActiveImageUri();
-    if (!currentUri) return;
+    if (!currentUri || !guestDoc) return;
 
     try {
       setRotating(true);
+
+      // 1. Physically rotate image on-device
       const manipResult = await ImageManipulator.manipulateAsync(
         currentUri,
         [{ rotate: 90 }],
         { compress: 0.85, format: ImageManipulator.SaveFormat.JPEG }
       );
 
-      setCustomImageUris((prev) => ({
-        ...prev,
-        [selectedDocTab]: manipResult.uri,
-      }));
+      // 2. Determine target permanent path inside documents directory
+      const docDir = `${FileSystem.documentDirectory}documents/${submissionId}/`;
+      await FileSystem.makeDirectoryAsync(docDir, { intermediates: true });
+
+      let targetColumn = 'passport_bio_path';
+      let fileKey = 'passport';
+
+      if (selectedDocTab === 'visa_document') {
+        targetColumn = 'visa_document_path';
+        fileKey = 'visadoc';
+      } else if (selectedDocTab === 'visa_stamp') {
+        targetColumn = 'visa_stamp_path';
+        fileKey = 'visa';
+      } else if (selectedDocTab === 'stamp') {
+        targetColumn = 'entry_stamp_path';
+        fileKey = 'stamp';
+      } else if (selectedDocTab === 'form_c') {
+        targetColumn = 'form_c_path';
+        fileKey = 'form_c';
+      } else if (selectedDocTab === 'photo') {
+        targetColumn = 'guest_photo_path';
+        fileKey = 'guest_photo';
+      }
+
+      // Add timestamp to force cache invalidation in React Native Image cache
+      const destUri = `${docDir}${fileKey}_${Date.now()}.jpg`;
+      await FileSystem.copyAsync({ from: manipResult.uri, to: destUri });
+
+      // 3. Persist new path directly into SQLite
+      const db = await openDatabase();
+      await db.runAsync(
+        `UPDATE guest_documents SET ${targetColumn} = ? WHERE submission_id = ?;`,
+        [destUri, submissionId]
+      );
+
+      // 4. Update memory state
+      setGuestDoc((prev) => (prev ? { ...prev, [targetColumn]: destUri } : prev));
     } catch (err: any) {
-      Alert.alert('Rotation Error', err.message || 'Could not rotate image.');
+      Alert.alert('Rotation Error', err.message || 'Could not save rotated image.');
     } finally {
       setRotating(false);
     }
+  };
+
+  const handleZoomIn = () => {
+    setZoomScale((prev) => Math.min(prev + 0.5, 3.5));
+  };
+
+  const handleZoomOut = () => {
+    setZoomScale((prev) => Math.max(prev - 0.5, 1.0));
+  };
+
+  const handleZoomReset = () => {
+    setZoomScale(1.0);
   };
 
   const updateField = (key: keyof FormCData, value: string) => {
@@ -333,6 +388,9 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
     }
   };
 
+  /**
+   * Re-submits documents to the Dell server using the latest permanently saved paths.
+   */
   const handleReSubmit = async () => {
     if (!guestDoc || !guestDoc.passport_bio_path) {
       Alert.alert('Error', 'Passport bio image is required to initiate extraction.');
@@ -341,23 +399,25 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
 
     try {
       setReSubmitting(true);
-      const submitRes = await submitPassportBio(customImageUris['passport'] || guestDoc.passport_bio_path);
+      // Upload current (potentially rotated) passport bio
+      const submitRes = await submitPassportBio(guestDoc.passport_bio_path);
       const newJobId = submitRes.job_id;
 
-      const vPath = customImageUris['visa_document'] || guestDoc.visa_document_path;
-      if (vPath) await attachDocumentToJob(newJobId, 'visa_document', vPath);
-
-      const vsPath = customImageUris['visa_stamp'] || guestDoc.visa_stamp_path;
-      if (vsPath) await attachDocumentToJob(newJobId, 'visa_stamp', vsPath);
-
-      const sPath = customImageUris['stamp'] || guestDoc.entry_stamp_path;
-      if (sPath) await attachDocumentToJob(newJobId, 'entry_stamp', sPath);
-
-      const fPath = customImageUris['form_c'] || guestDoc.form_c_path;
-      if (fPath) await attachDocumentToJob(newJobId, 'welcome_form', fPath);
-
-      const pPath = customImageUris['photo'] || guestDoc.guest_photo_path;
-      if (pPath) await attachDocumentToJob(newJobId, 'guest_photo', pPath);
+      if (guestDoc.visa_document_path) {
+        await attachDocumentToJob(newJobId, 'visa_document', guestDoc.visa_document_path);
+      }
+      if (guestDoc.visa_stamp_path) {
+        await attachDocumentToJob(newJobId, 'visa_stamp', guestDoc.visa_stamp_path);
+      }
+      if (guestDoc.entry_stamp_path) {
+        await attachDocumentToJob(newJobId, 'entry_stamp', guestDoc.entry_stamp_path);
+      }
+      if (guestDoc.form_c_path) {
+        await attachDocumentToJob(newJobId, 'welcome_form', guestDoc.form_c_path);
+      }
+      if (guestDoc.guest_photo_path) {
+        await attachDocumentToJob(newJobId, 'guest_photo', guestDoc.guest_photo_path);
+      }
 
       await startJobProcessing(newJobId);
 
@@ -373,7 +433,7 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
 
       Alert.alert(
         'Re-Submitted',
-        'Documents re-submitted to the server. Processing has restarted.',
+        'Documents re-submitted to the server with current orientation. Processing restarted.',
         [{ text: 'OK', onPress: onComplete }]
       );
     } catch (err: any) {
@@ -445,10 +505,12 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
   }
 
   const activeImageUri = getActiveImageUri();
+  const screenWidth = Dimensions.get('window').width;
+  const paneHeight = Dimensions.get('window').height * 0.38;
 
   return (
     <SafeAreaView style={[styles.container, { backgroundColor: colors.background }]}>
-      {/* Header Bar */}
+      {/* Top Header Bar */}
       <View style={[styles.header, { borderBottomColor: colors.border }]}>
         <TouchableOpacity onPress={onBack} style={styles.backButton}>
           <Text style={[styles.backButtonText, { color: colors.primaryBrand }]}>← Back</Text>
@@ -467,19 +529,35 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
         </TouchableOpacity>
       </View>
 
-      {/* --- Fixed Pinch-to-Zoom Document Preview Pane --- */}
+      {/* --- Native Zoom & Pan Document Preview Pane --- */}
       <View style={[styles.imageViewerPane, { backgroundColor: isDark ? '#000000' : '#F1F5F9' }]}>
         {activeImageUri ? (
           <ScrollView
-            maximumZoomScale={4.0}
-            minimumZoomScale={1.0}
+            horizontal
             showsHorizontalScrollIndicator={false}
-            showsVerticalScrollIndicator={false}
-            contentContainerStyle={styles.zoomContent}
+            contentContainerStyle={styles.horizontalZoomScroll}
           >
-            <View style={styles.zoomableImageWrapper}>
-              <Image source={{ uri: activeImageUri }} style={styles.previewImage} resizeMode="contain" />
-            </View>
+            <ScrollView
+              showsVerticalScrollIndicator={false}
+              contentContainerStyle={styles.verticalZoomScroll}
+            >
+              <View
+                style={[
+                  styles.scalableContainer,
+                  {
+                    width: screenWidth * zoomScale,
+                    height: paneHeight * zoomScale,
+                  },
+                ]}
+              >
+                <Image
+                  key={activeImageUri}
+                  source={{ uri: activeImageUri }}
+                  style={styles.previewImage}
+                  resizeMode="contain"
+                />
+              </View>
+            </ScrollView>
           </ScrollView>
         ) : (
           <View style={styles.noImagePlaceholder}>
@@ -488,11 +566,21 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
             </Text>
           </View>
         )}
-        <View style={styles.zoomHintBadge}>
-          <Text style={styles.zoomHintText}>🔍 Pinch to zoom</Text>
+
+        {/* Zoom Level Indicator & Controls Toolbar */}
+        <View style={styles.zoomControlBar}>
+          <TouchableOpacity onPress={handleZoomOut} style={styles.zoomBtn}>
+            <Text style={styles.zoomBtnText}>−</Text>
+          </TouchableOpacity>
+          <TouchableOpacity onPress={handleZoomReset} style={styles.zoomResetBtn}>
+            <Text style={styles.zoomResetText}>{Math.round(zoomScale * 100)}%</Text>
+          </TouchableOpacity>
+          <TouchableOpacity onPress={handleZoomIn} style={styles.zoomBtn}>
+            <Text style={styles.zoomBtnText}>+</Text>
+          </TouchableOpacity>
         </View>
 
-        {/* Task 51: Rotate Button for Active Document Tab */}
+        {/* Task 53: Permanent Rotate Button */}
         {activeImageUri && (
           <TouchableOpacity
             disabled={rotating}
@@ -502,7 +590,7 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
             {rotating ? (
               <ActivityIndicator size="small" color="#FFFFFF" />
             ) : (
-              <Text style={styles.floatingRotateText}>⟳ Rotate 90°</Text>
+              <Text style={styles.floatingRotateText}>⟳ Rotate 90° (Save)</Text>
             )}
           </TouchableOpacity>
         )}
@@ -713,14 +801,17 @@ const styles = StyleSheet.create({
     position: 'relative',
     overflow: 'hidden',
   },
-  zoomContent: {
+  horizontalZoomScroll: {
     flexGrow: 1,
     justifyContent: 'center',
     alignItems: 'center',
   },
-  zoomableImageWrapper: {
-    width: Dimensions.get('window').width,
-    height: Dimensions.get('window').height * 0.38,
+  verticalZoomScroll: {
+    flexGrow: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  scalableContainer: {
     justifyContent: 'center',
     alignItems: 'center',
   },
@@ -738,29 +829,47 @@ const styles = StyleSheet.create({
     fontSize: 14,
     textAlign: 'center',
   },
-  zoomHintBadge: {
+  zoomControlBar: {
     position: 'absolute',
     bottom: 8,
     right: 12,
-    backgroundColor: 'rgba(0,0,0,0.6)',
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-    borderRadius: 6,
+    flexDirection: 'row',
+    backgroundColor: 'rgba(0,0,0,0.7)',
+    borderRadius: 8,
+    padding: 2,
+    alignItems: 'center',
     zIndex: 10,
   },
-  zoomHintText: {
+  zoomBtn: {
+    width: 32,
+    height: 32,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  zoomBtnText: {
     color: '#FFFFFF',
-    fontSize: 11,
-    fontWeight: '500',
+    fontSize: 18,
+    fontWeight: '700',
+  },
+  zoomResetBtn: {
+    paddingHorizontal: 8,
+    height: 32,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  zoomResetText: {
+    color: '#FFFFFF',
+    fontSize: 12,
+    fontWeight: '600',
   },
   floatingRotateButton: {
     position: 'absolute',
     bottom: 8,
     left: 12,
     backgroundColor: 'rgba(0,0,0,0.75)',
-    paddingHorizontal: 10,
-    paddingVertical: 5,
-    borderRadius: 6,
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    borderRadius: 8,
     zIndex: 10,
   },
   floatingRotateText: {
