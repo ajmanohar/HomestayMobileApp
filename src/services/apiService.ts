@@ -10,7 +10,7 @@
 // Key Features:
 // - Task 42: Dual Visa Support (visa_document vs visa_stamp)
 // - Task 44: Mobile-Triggered Deletion (deleteJob cascade purge)
-// - Full backward compatibility for syncManager.ts and DashboardScreen.tsx
+// - Exports submitGuestDocuments for syncManager compatibility
 // ==============================================================================
 
 import * as FileSystem from 'expo-file-system/legacy';
@@ -19,16 +19,10 @@ import * as FileSystem from 'expo-file-system/legacy';
 // Configuration: Production endpoint and pre-shared Bearer Token
 // ------------------------------------------------------------------------------
 
-// Base URL for PassportReadAPI endpoint via Cloudflare Tunnel
 const DEFAULT_API_BASE_URL = 'https://api.theasymptotebrief.com/api/v1';
-
-// Resolve configured base URL from Expo public environment variable or fallback
 const API_BASE_URL = process.env.EXPO_PUBLIC_API_URL || DEFAULT_API_BASE_URL;
 
-// Pre-shared Bearer API key configured in /opt/PassportReadAPI/.env on the server
 const DEFAULT_BEARER_TOKEN = '388f64ef3bea954970952b97a477e9822aaf4c2fad7d3b046caf8df82a224f88';
-
-// Resolve active Bearer token from environment variable or constant
 const API_BEARER_TOKEN = process.env.EXPO_PUBLIC_API_BEARER_TOKEN || DEFAULT_BEARER_TOKEN;
 
 /**
@@ -69,10 +63,6 @@ export interface JobDeleteResponse {
   message?: string;
 }
 
-/**
- * Supported document attachment types on the Dell edge server.
- * Supports dual-visa (visa_document vs visa_stamp) and legacy visa_page.
- */
 export type DocumentAttachmentType =
   | 'visa_document'
   | 'visa_stamp'
@@ -139,7 +129,6 @@ export const attachDocumentToJob = async (
   }
 };
 
-// Convenience alias preserving backwards-compatibility
 export const attachDocument = attachDocumentToJob;
 
 /**
@@ -160,6 +149,39 @@ export const startJobProcessing = async (jobId: string): Promise<void> => {
     const errorText = await response.text();
     console.warn(`[API] Start job returned HTTP ${response.status}: ${errorText}`);
   }
+};
+
+/**
+ * Convenience multi-document dispatcher used by syncManager.
+ * Ingests passport bio, sequentially attaches all available document images,
+ * and starts the worker.
+ */
+export const submitGuestDocuments = async (
+  passportBioPath: string,
+  visaPath?: string,
+  entryStampPath?: string,
+  formCPath?: string,
+  reference?: string
+): Promise<CreateJobResponse> => {
+  // 1. Submit passport bio to initialize the job on Dell server
+  const jobRes = await submitPassportBio(passportBioPath);
+  const jobId = jobRes.job_id;
+
+  // 2. Attach optional secondary captures
+  if (visaPath) {
+    await attachDocumentToJob(jobId, 'visa_page', visaPath);
+  }
+  if (entryStampPath) {
+    await attachDocumentToJob(jobId, 'entry_stamp', entryStampPath);
+  }
+  if (formCPath) {
+    await attachDocumentToJob(jobId, 'welcome_form', formCPath);
+  }
+
+  // 3. Trigger background queue worker
+  await startJobProcessing(jobId);
+
+  return jobRes;
 };
 
 /**
@@ -186,7 +208,6 @@ export const getJobStatus = async (jobId: string): Promise<JobStatusResponse> =>
   return data;
 };
 
-// Convenience alias preserving backwards-compatibility
 export const pollJobStatus = getJobStatus;
 
 /**
