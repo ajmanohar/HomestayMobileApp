@@ -11,7 +11,8 @@
 // Features:
 // - Task 42: Dynamic stage pills for Dual Visa (Visa Document vs. Visa Stamp).
 // - Task 44: Mobile-Triggered Deletion with cascade purge to Dell edge server.
-// - Task 45: Reads isolated per-document status containers with fallback.
+// - Task 45 & 47: Strict per-document stage badge synchronization. Prevents
+//   pills from prematurely turning 'Done ✓' while background extraction is running.
 // ==============================================================================
 
 import React, { useState, useEffect, useCallback } from 'react';
@@ -298,7 +299,15 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
 
   /**
    * Evaluates the progress state of an individual document extraction pipeline.
-   * Checks both isolated document containers (Task 45) and top-level fields.
+   * Task 47 Guard: Strictly adheres to isolated document containers so that
+   * unextracted stages do not prematurely display 'Done ✓' while the overall
+   * job is still undergoing PROCESSING on the remote server.
+   *
+   * @param submissionStatus Current lifecycle state of the submission.
+   * @param extractedData Parsed JSON payload stored in SQLite.
+   * @param imagePath Local path or URI of the document image.
+   * @param subDocumentKey Isolated container key ('passport_bio', 'visa_document', etc.).
+   * @param fieldKeys List of attribute names to check for non-empty values.
    */
   const evaluateServiceStage = (
     submissionStatus: SubmissionStatus,
@@ -307,15 +316,17 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
     subDocumentKey?: string,
     fieldKeys: string[] = []
   ): StageStatus => {
+    // 1. If no image was ever photographed for this stage, it is not attached
     if (!imagePath) {
       return 'NOT_ATTACHED';
     }
 
+    // 2. If no extracted data payload exists yet in database
     if (!extractedData) {
       return submissionStatus === 'PROCESSING' ? 'PROCESSING' : 'PENDING';
     }
 
-    // Task 45: Check isolated document bucket first
+    // 3. Task 45 & 47: Check specific isolated document container
     if (subDocumentKey && extractedData.documents && extractedData.documents[subDocumentKey]) {
       const bucket = extractedData.documents[subDocumentKey];
       const hasExtractedBucketValue = fieldKeys.some((k) => {
@@ -326,13 +337,22 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
         }
         return String(field).trim() !== '';
       });
+
       if (hasExtractedBucketValue) {
-        return 'COMPLETED';
+        return 'COMPLETED'; // Successfully extracted for this document
       }
+
+      // If bucket exists but has no extracted values yet, check overall job state
+      return submissionStatus === 'PROCESSING' ? 'PROCESSING' : 'PENDING';
     }
 
-    // Top-level fallback
-    const hasExtractedValue = fieldKeys.some((k) => {
+    // 4. Guard against premature completion when still processing
+    if (submissionStatus === 'PROCESSING') {
+      return 'PROCESSING';
+    }
+
+    // 5. If the job is already finished (PENDING_REVIEW or SUBMITTED), inspect top-level fields
+    const hasTopLevelValue = fieldKeys.some((k) => {
       const field = extractedData[k];
       if (!field) return false;
       if (typeof field === 'object' && 'value' in field) {
@@ -341,11 +361,11 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
       return String(field).trim() !== '';
     });
 
-    if (hasExtractedValue) {
+    if (hasTopLevelValue) {
       return 'COMPLETED';
     }
 
-    return submissionStatus === 'PROCESSING' ? 'PROCESSING' : 'PENDING';
+    return 'PENDING';
   };
 
   /**
@@ -391,6 +411,7 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
       case 'PENDING_REVIEW':
         return { backgroundColor: colors.statusReady, label: 'Ready for Review' };
       case 'SUBMITTED':
+      case 'REVIEWED':
         return { backgroundColor: '#10B981', label: 'Verified' };
       case 'FAILED':
         return { backgroundColor: '#EF4444', label: 'Failed' };
@@ -422,7 +443,7 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
    */
   const renderSubmissionItem = ({ item }: { item: SubmissionWithGuests }) => {
     const badge = getStatusBadgeStyle(item.status);
-    const isReadyForReview = item.status === 'PENDING_REVIEW' || item.status === 'SUBMITTED';
+    const isReadyForReview = item.status === 'PENDING_REVIEW' || item.status === 'SUBMITTED' || item.status === 'REVIEWED';
     const isUploadPending = item.status === 'UPLOAD_PENDING';
     const isProcessing = item.status === 'PROCESSING';
     const isThisCardActive = retryingId === item.id;
@@ -466,7 +487,7 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
           </View>
         </TouchableOpacity>
 
-        {/* Granular Per-Guest Service Pipeline Badges (Task 42 & 45) */}
+        {/* Granular Per-Guest Service Pipeline Badges (Task 42, 45 & 47) */}
         <View style={[styles.guestListContainer, { borderTopColor: colors.border }]}>
           {guestList.map((guest, idx) => {
             let extractedData: any = null;
