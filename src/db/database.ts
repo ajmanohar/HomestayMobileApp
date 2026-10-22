@@ -25,6 +25,7 @@ export type SubmissionStatus =
   | 'PROCESSING'
   | 'PENDING_REVIEW'
   | 'SUBMITTED'
+  | 'REVIEWED'
   | 'FAILED';
 
 export interface SubmissionRecord {
@@ -32,8 +33,9 @@ export interface SubmissionRecord {
   reference: string | null;
   guest_count: number;
   status: SubmissionStatus;
-  job_id: string | null;
+  job_id?: string | null;
   created_at: string;
+  updated_at?: string;
 }
 
 export interface GuestDocumentRecord {
@@ -47,7 +49,7 @@ export interface GuestDocumentRecord {
   form_c_path?: string | null;
   guest_photo_path?: string | null;
   extracted_data_json?: string | null;
-  created_at: string;
+  created_at?: string;
 }
 
 // ------------------------------------------------------------------------------
@@ -154,10 +156,10 @@ export const createSubmission = async (
  * Persists local image paths captured for a guest in a submission.
  */
 export const saveGuestDocuments = async (
-  doc: Omit<GuestDocumentRecord, 'created_at'>
+  doc: GuestDocumentRecord
 ): Promise<void> => {
   const db = await openDatabase();
-  const createdAt = new Date().toISOString();
+  const createdAt = doc.created_at || new Date().toISOString();
 
   await db.runAsync(
     `INSERT INTO guest_documents (
@@ -179,6 +181,38 @@ export const saveGuestDocuments = async (
       createdAt,
     ]
   );
+};
+
+/**
+ * Convenience batch helper used by CaptureScreen to persist both
+ * submission metadata and all guest document child rows in one call.
+ */
+export const insertSubmission = async (
+  submission: SubmissionRecord,
+  docs: GuestDocumentRecord[]
+): Promise<void> => {
+  const db = await openDatabase();
+  const createdAt = submission.created_at || new Date().toISOString();
+
+  await db.runAsync(
+    `INSERT INTO submissions (id, reference, guest_count, status, job_id, created_at)
+     VALUES (?, ?, ?, ?, ?, ?);`,
+    [
+      submission.id,
+      submission.reference ?? null,
+      submission.guest_count,
+      submission.status,
+      submission.job_id ?? null,
+      createdAt,
+    ]
+  );
+
+  for (const doc of docs) {
+    await saveGuestDocuments({
+      ...doc,
+      created_at: doc.created_at || createdAt,
+    });
+  }
 };
 
 /**
@@ -206,16 +240,25 @@ export const getSubmissionById = async (id: string): Promise<SubmissionRecord | 
 
 /**
  * Updates the lifecycle execution state of a submission.
+ * Accepts optional jobId to bind server-assigned job ID simultaneously.
  */
 export const updateSubmissionStatus = async (
   id: string,
-  newStatus: SubmissionStatus
+  newStatus: SubmissionStatus,
+  jobId?: string | null
 ): Promise<void> => {
   const db = await openDatabase();
-  await db.runAsync(
-    `UPDATE submissions SET status = ? WHERE id = ?;`,
-    [newStatus, id]
-  );
+  if (jobId) {
+    await db.runAsync(
+      `UPDATE submissions SET status = ?, job_id = ? WHERE id = ?;`,
+      [newStatus, jobId, id]
+    );
+  } else {
+    await db.runAsync(
+      `UPDATE submissions SET status = ? WHERE id = ?;`,
+      [newStatus, id]
+    );
+  }
 };
 
 /**
@@ -271,7 +314,6 @@ export const deleteSubmissionLocallyAndRemote = async (submissionId: string): Pr
       console.log(`[Database] Remote server job ${remoteJobId} successfully purged.`);
     } catch (remoteErr) {
       console.warn(`[Database] Remote purge notice for job ${remoteJobId}:`, remoteErr);
-      // We continue to purge local database so user is not blocked
     }
   }
 
