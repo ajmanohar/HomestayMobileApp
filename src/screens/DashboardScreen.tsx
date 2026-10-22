@@ -1,14 +1,18 @@
-/**
- * DashboardScreen.tsx
- * Primary operational dashboard for Homestay Document Capture & Processing.
- * 
- * Responsibilities:
- * - Displays active guest document capture batches and statuses.
- * - Manages submission re-extraction triggers with automatic residual cache invalidation.
- * - Handles extraction failure states gracefully, preventing cards from getting stuck in PROCESSING.
- * - Renders granular per-document service pipeline status pills (Passport, Visa, Stamp, Form-C).
- * - Interfaces with secure storage for encrypted Form-C portal credentials.
- */
+// ==============================================================================
+// DashboardScreen.tsx - HomestayMobileApp (React Native / Expo SDK 57)
+// ==============================================================================
+// Main guest submissions dashboard displaying real-time extraction progress,
+// per-document stage badges, re-submission controls, and cascading deletion.
+//
+// Lifecycle Constraints (Task 43):
+// - Portal auto-submission is removed from mobile.
+// - Mobile lifecycle ends at Review & Re-submit.
+//
+// Features:
+// - Task 42: Dynamic stage pills for Dual Visa (Visa Document vs. Visa Stamp).
+// - Task 44: Mobile-Triggered Deletion with cascade purge to Dell edge server.
+// - Task 45: Reads isolated per-document status containers with fallback.
+// ==============================================================================
 
 import React, { useState, useEffect, useCallback } from 'react';
 import {
@@ -23,27 +27,18 @@ import {
   Modal,
   TextInput,
 } from 'react-native';
-
-// App theme context and dark/light mode tokens
 import { useAppTheme } from '../theme/ThemeContext';
-
-// Local SQLite database providers and models
 import {
   getAllSubmissions,
   openDatabase,
   updateSubmissionStatus,
+  deleteSubmissionLocallyAndRemote,
   SubmissionRecord,
   GuestDocumentRecord,
   SubmissionStatus,
 } from '../db/database';
-
-// Asynchronous background synchronization services
 import { runFullSync, pollJobUntilComplete } from '../services/syncManager';
-
-// HTTP boundary client for remote FastAPI document ingestion
-import { submitGuestDocuments } from '../services/apiService';
-
-// Secure credentials store for Form-C portal automation
+import { submitPassportBio, attachDocumentToJob, startJobProcessing } from '../services/apiService';
 import {
   getPortalCredentials,
   savePortalCredentials,
@@ -53,7 +48,6 @@ import {
 interface DashboardScreenProps {
   onStartNewCapture: () => void;
   onOpenReview: (submissionId: string) => void;
-  onOpenPortal: (submissionId: string) => void;
 }
 
 /**
@@ -71,8 +65,8 @@ type StageStatus = 'PENDING' | 'PROCESSING' | 'COMPLETED' | 'NOT_ATTACHED';
 export const DashboardScreen: React.FC<DashboardScreenProps> = ({
   onStartNewCapture,
   onOpenReview,
-  onOpenPortal,
 }) => {
+  // Theme styling tokens (supports dynamic light / dark mode toggle)
   const { colors, isDark, toggleTheme } = useAppTheme();
 
   // Screen queue and processing states
@@ -80,6 +74,7 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
   const [loading, setLoading] = useState<boolean>(true);
   const [refreshing, setRefreshing] = useState<boolean>(false);
   const [retryingId, setRetryingId] = useState<string | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
 
   // Portal credentials modal state
   const [isCredsModalVisible, setIsCredsModalVisible] = useState<boolean>(false);
@@ -126,6 +121,10 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
       setLoading(false);
     }
   }, []);
+
+  useEffect(() => {
+    loadSubmissions();
+  }, [loadSubmissions]);
 
   /**
    * Pull-to-refresh handler: runs sync runner against backend API,
@@ -197,9 +196,7 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
 
   /**
    * Resubmits an entire submission for background AI extraction without re-capturing images.
-   * Clears stale extraction cache and resets to UPLOAD_PENDING if an error occurs.
-   *
-   * @param item - The submission record to re-extract
+   * Dispatches passport bio first, attaches optional documents, and triggers worker start.
    */
   const handleTriggerReExtract = async (item: SubmissionWithGuests) => {
     if (!item || !item.id) {
@@ -207,139 +204,209 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
       return;
     }
 
-    const safeSubmissionId = String(item.id).trim();
-    const guestList = Array.isArray(item.guests) ? item.guests : [];
-
-    if (guestList.length === 0) {
-      Alert.alert('Error', 'No guest document records found for this submission.');
-      return;
-    }
-
-    const guestDoc = guestList[0];
-
     try {
       setRetryingId(item.id);
-      console.log(`[Dashboard] Starting submission-level re-extraction for ID: ${item.id}`);
+      const guestList = Array.isArray(item.guests) ? item.guests : [];
 
-      const db = await openDatabase();
-
-      // Clear stale extraction JSON so stage badges reset
-      console.log(`[Dashboard] Invalidating stale extraction cache for: ${safeSubmissionId}`);
-      await db.runAsync(
-        'UPDATE guest_documents SET extracted_data_json = NULL WHERE submission_id = ?;',
-        [safeSubmissionId]
-      );
-
-      // Transition to PROCESSING
-      await updateSubmissionStatus(safeSubmissionId, 'PROCESSING');
-      await loadSubmissions();
-
-      // Dispatch documents to backend FastAPI endpoint
-      const response = await submitGuestDocuments(
-        guestDoc.passport_bio_path,
-        guestDoc.visa_stamp_path ?? undefined,
-        guestDoc.entry_stamp_path ?? undefined,
-        guestDoc.form_c_path ?? undefined,
-        item.reference ?? undefined
-      );
-
-      console.log(`[Dashboard] Re-upload succeeded with job_id: ${response.job_id}`);
-
-      // Save new job_id in SQLite
-      await updateSubmissionStatus(safeSubmissionId, 'PROCESSING', response.job_id);
-      await loadSubmissions();
-
-      // Poll in background
-      pollJobUntilComplete(safeSubmissionId, response.job_id)
-        .then(() => loadSubmissions())
-        .catch((err) => {
-          console.warn('[Dashboard] Background polling error:', err);
-          loadSubmissions();
-        });
-
-      Alert.alert(
-        'Processing Initiated',
-        `Job dispatched to server with ID: ${response.job_id.slice(0, 8)}... Stage labels will update automatically.`
-      );
-    } catch (error: any) {
-      console.error(`[Dashboard] Re-extraction request failed for ${item.id}:`, error);
-
-      // Reset to UPLOAD_PENDING so the card does not remain stuck on "AI extraction in progress"
-      try {
-        await updateSubmissionStatus(safeSubmissionId, 'UPLOAD_PENDING');
-        await loadSubmissions();
-      } catch (dbErr) {
-        console.warn('[Dashboard] Failed to reset status after error:', dbErr);
+      if (guestList.length === 0) {
+        Alert.alert('Error', 'No guest document records found for this submission.');
+        return;
       }
 
-      Alert.alert(
-        'Submission Failed',
-        `Could not reach extraction service: ${error.message || error}`
+      const guestDoc = guestList[0];
+      if (!guestDoc.passport_bio_path) {
+        Alert.alert('Error', 'Passport bio image path is missing.');
+        return;
+      }
+
+      // 1. Submit passport bio to initialize new job
+      const submitRes = await submitPassportBio(guestDoc.passport_bio_path);
+      const newJobId = submitRes.job_id;
+
+      // 2. Attach optional secondary captures
+      if (guestDoc.visa_document_path) {
+        await attachDocumentToJob(newJobId, 'visa_document', guestDoc.visa_document_path);
+      }
+      if (guestDoc.visa_stamp_path) {
+        await attachDocumentToJob(newJobId, 'visa_stamp', guestDoc.visa_stamp_path);
+      }
+      if (guestDoc.entry_stamp_path) {
+        await attachDocumentToJob(newJobId, 'entry_stamp', guestDoc.entry_stamp_path);
+      }
+      if (guestDoc.form_c_path) {
+        await attachDocumentToJob(newJobId, 'welcome_form', guestDoc.form_c_path);
+      }
+      if (guestDoc.guest_photo_path) {
+        await attachDocumentToJob(newJobId, 'guest_photo', guestDoc.guest_photo_path);
+      }
+
+      // 3. Trigger worker
+      await startJobProcessing(newJobId);
+
+      // 4. Update local SQLite database
+      const db = await openDatabase();
+      await db.runAsync('UPDATE submissions SET status = ?, job_id = ? WHERE id = ?;', [
+        'PROCESSING',
+        newJobId,
+        item.id,
+      ]);
+      await db.runAsync('UPDATE guest_documents SET extracted_data_json = NULL WHERE submission_id = ?;', [
+        item.id,
+      ]);
+
+      // 5. Kick off background polling
+      pollJobUntilComplete(item.id, newJobId).catch((pollErr) =>
+        console.warn(`[Dashboard] Polling loop error for ${item.id}:`, pollErr)
       );
+
+      await loadSubmissions();
+    } catch (err: any) {
+      Alert.alert('Re-submission Failed', err.message || 'Unable to re-submit documents.');
     } finally {
       setRetryingId(null);
     }
   };
 
-  useEffect(() => {
-    loadSubmissions();
-  }, [loadSubmissions]);
-
-  const getStatusBadgeStyle = (status: SubmissionStatus) => {
-    switch (status) {
-      case 'UPLOAD_PENDING':
-        return { backgroundColor: colors.statusPending, label: 'Upload Pending' };
-      case 'PROCESSING':
-        return { backgroundColor: colors.statusProcess, label: 'Processing' };
-      case 'PENDING_REVIEW':
-        return { backgroundColor: colors.statusReady, label: 'Ready for Review' };
-      case 'REVIEWED':
-        return { backgroundColor: colors.statusDone, label: 'Reviewed' };
-      default:
-        return { backgroundColor: colors.textMuted, label: status };
-    }
+  /**
+   * Permanently deletes a submission locally and cascades purge to the Dell server (Task 44).
+   */
+  const handleDeleteSubmission = (submissionId: string) => {
+    Alert.alert(
+      'Delete Submission',
+      'Permanently delete this submission and all associated document images from this device and the server?',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              setDeletingId(submissionId);
+              await deleteSubmissionLocallyAndRemote(submissionId);
+              await loadSubmissions();
+              Alert.alert('Deleted', 'Submission and server artifacts permanently deleted.');
+            } catch (err: any) {
+              Alert.alert('Delete Failed', err.message || 'Could not delete submission.');
+            } finally {
+              setDeletingId(null);
+            }
+          },
+        },
+      ]
+    );
   };
 
+  /**
+   * Evaluates the progress state of an individual document extraction pipeline.
+   * Checks both isolated document containers (Task 45) and top-level fields.
+   */
   const evaluateServiceStage = (
     submissionStatus: SubmissionStatus,
     extractedData: any,
-    documentPath: string | null | undefined,
-    fieldKeys: string[]
+    imagePath: string | null | undefined,
+    subDocumentKey?: string,
+    fieldKeys: string[] = []
   ): StageStatus => {
-    if (!documentPath) {
+    if (!imagePath) {
       return 'NOT_ATTACHED';
     }
 
-    if (extractedData && typeof extractedData === 'object') {
-      const hasExtractedField = fieldKeys.some((k) => {
-        const val = extractedData[k];
-        if (!val) return false;
-        if (typeof val === 'object' && 'value' in val) {
-          return val.value !== null && val.value !== undefined && String(val.value).trim().length > 0;
-        }
-        return String(val).trim().length > 0;
-      });
+    if (!extractedData) {
+      return submissionStatus === 'PROCESSING' ? 'PROCESSING' : 'PENDING';
+    }
 
-      if (hasExtractedField) {
+    // Task 45: Check isolated document bucket first
+    if (subDocumentKey && extractedData.documents && extractedData.documents[subDocumentKey]) {
+      const bucket = extractedData.documents[subDocumentKey];
+      const hasExtractedBucketValue = fieldKeys.some((k) => {
+        const field = bucket[k];
+        if (!field) return false;
+        if (typeof field === 'object' && 'value' in field) {
+          return field.value !== null && field.value !== undefined && String(field.value).trim() !== '';
+        }
+        return String(field).trim() !== '';
+      });
+      if (hasExtractedBucketValue) {
         return 'COMPLETED';
       }
     }
 
-    if (submissionStatus === 'PROCESSING') {
-      return 'PROCESSING';
-    }
+    // Top-level fallback
+    const hasExtractedValue = fieldKeys.some((k) => {
+      const field = extractedData[k];
+      if (!field) return false;
+      if (typeof field === 'object' && 'value' in field) {
+        return field.value !== null && field.value !== undefined && String(field.value).trim() !== '';
+      }
+      return String(field).trim() !== '';
+    });
 
-    if (submissionStatus === 'PENDING_REVIEW' || submissionStatus === 'REVIEWED') {
+    if (hasExtractedValue) {
       return 'COMPLETED';
     }
 
-    return 'PENDING';
+    return submissionStatus === 'PROCESSING' ? 'PROCESSING' : 'PENDING';
   };
 
-  const formatDate = (isoString: string): string => {
+  /**
+   * Helper rendering an individual stage pill badge.
+   */
+  const renderStagePill = (label: string, stageStatus: StageStatus) => {
+    let pillBg = colors.surfaceSubtle;
+    let textColor = colors.textMuted;
+    let statusText = 'Pending ⏳';
+
+    if (stageStatus === 'COMPLETED') {
+      pillBg = colors.statusReady; // Emerald green
+      textColor = '#FFFFFF';
+      statusText = 'Done ✓';
+    } else if (stageStatus === 'PROCESSING') {
+      pillBg = colors.statusProcess; // Blue
+      textColor = '#FFFFFF';
+      statusText = 'Running ⏳';
+    } else if (stageStatus === 'NOT_ATTACHED') {
+      pillBg = colors.surfaceSubtle;
+      textColor = colors.textMuted;
+      statusText = 'None';
+    }
+
+    return (
+      <View style={[styles.stagePill, { backgroundColor: pillBg, borderColor: colors.border }]} key={label}>
+        <Text style={[styles.stagePillLabel, { color: textColor }]}>
+          {label}: <Text style={{ fontWeight: '700' }}>{statusText}</Text>
+        </Text>
+      </View>
+    );
+  };
+
+  /**
+   * Maps overall submission status to a human badge.
+   */
+  const getStatusBadgeStyle = (status: SubmissionStatus) => {
+    switch (status) {
+      case 'UPLOAD_PENDING':
+        return { backgroundColor: '#F59E0B', label: 'Upload Pending' };
+      case 'PROCESSING':
+        return { backgroundColor: colors.statusProcess, label: 'Processing' };
+      case 'PENDING_REVIEW':
+        return { backgroundColor: colors.statusReady, label: 'Ready for Review' };
+      case 'SUBMITTED':
+        return { backgroundColor: '#10B981', label: 'Verified' };
+      case 'FAILED':
+        return { backgroundColor: '#EF4444', label: 'Failed' };
+      default:
+        return { backgroundColor: '#64748B', label: status };
+    }
+  };
+
+  /**
+   * Formats ISO timestamp into a readable date string.
+   */
+  const formatDate = (isoString?: string) => {
+    if (!isoString) return '';
     try {
-      const date = new Date(isoString);
-      return date.toLocaleDateString(undefined, {
+      const d = new Date(isoString);
+      return d.toLocaleDateString(undefined, {
         month: 'short',
         day: 'numeric',
         hour: '2-digit',
@@ -350,49 +417,16 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
     }
   };
 
-  const handleCardPress = (item: SubmissionWithGuests) => {
-    if (item.status === 'REVIEWED' || item.status === 'PENDING_REVIEW') {
-      onOpenReview(item.id);
-    } else if (item.status === 'UPLOAD_PENDING') {
-      handleTriggerReExtract(item);
-    }
-  };
-
-  const renderStagePill = (label: string, stageStatus: StageStatus) => {
-    let pillBg = colors.surfaceSubtle;
-    let textColor = colors.textMuted;
-    let statusText = 'Pending';
-
-    if (stageStatus === 'COMPLETED') {
-      pillBg = colors.statusReady;
-      textColor = '#FFFFFF';
-      statusText = 'Done ✓';
-    } else if (stageStatus === 'PROCESSING') {
-      pillBg = colors.statusProcess;
-      textColor = '#FFFFFF';
-      statusText = 'Running ⏳';
-    } else if (stageStatus === 'NOT_ATTACHED') {
-      pillBg = colors.surfaceSubtle;
-      textColor = colors.textMuted;
-      statusText = 'None';
-    }
-
-    return (
-      <View style={[styles.stagePill, { backgroundColor: pillBg, borderColor: colors.border }]}>
-        <Text style={[styles.stagePillLabel, { color: textColor }]}>
-          {label}: <Text style={{ fontWeight: '700' }}>{statusText}</Text>
-        </Text>
-      </View>
-    );
-  };
-
+  /**
+   * Renders each individual submission card with per-guest granular status strips.
+   */
   const renderSubmissionItem = ({ item }: { item: SubmissionWithGuests }) => {
     const badge = getStatusBadgeStyle(item.status);
-    const isReadyForReview = item.status === 'PENDING_REVIEW';
-    const isReviewed = item.status === 'REVIEWED';
+    const isReadyForReview = item.status === 'PENDING_REVIEW' || item.status === 'SUBMITTED';
     const isUploadPending = item.status === 'UPLOAD_PENDING';
     const isProcessing = item.status === 'PROCESSING';
     const isThisCardActive = retryingId === item.id;
+    const isThisCardDeleting = deletingId === item.id;
     const guestList = Array.isArray(item.guests) ? item.guests : [];
 
     return (
@@ -405,10 +439,8 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
           },
         ]}
       >
-        <TouchableOpacity
-          activeOpacity={0.7}
-          onPress={() => handleCardPress(item)}
-        >
+        {/* Card Header & Metadata */}
+        <TouchableOpacity activeOpacity={0.7} onPress={() => onOpenReview(item.id)}>
           <View style={styles.cardHeaderRow}>
             <Text style={[styles.referenceText, { color: colors.textPrimary }]} numberOfLines={1}>
               {item.reference || 'Homestay Guest Capture'}
@@ -434,7 +466,7 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
           </View>
         </TouchableOpacity>
 
-        {/* Per-Guest Stage Badges */}
+        {/* Granular Per-Guest Service Pipeline Badges (Task 42 & 45) */}
         <View style={[styles.guestListContainer, { borderTopColor: colors.border }]}>
           {guestList.map((guest, idx) => {
             let extractedData: any = null;
@@ -450,24 +482,40 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
               item.status,
               extractedData,
               guest.passport_bio_path,
+              'passport_bio',
               ['surname', 'given_names', 'passport_number', 'nationality']
             );
-            const visaStatus = evaluateServiceStage(
+
+            // Task 42: Dual Visa Status
+            const visaDocStatus = evaluateServiceStage(
+              item.status,
+              extractedData,
+              guest.visa_document_path,
+              'visa_document',
+              ['visa_number', 'visa_type', 'visa_issue_date', 'visa_expiry_date']
+            );
+
+            const visaStampStatus = evaluateServiceStage(
               item.status,
               extractedData,
               guest.visa_stamp_path,
+              'visa_stamp',
               ['visa_number', 'visa_type', 'visa_issue_date', 'visa_expiry_date']
             );
+
             const stampStatus = evaluateServiceStage(
               item.status,
               extractedData,
               guest.entry_stamp_path,
+              'entry_stamp',
               ['arrival_date_india', 'arrival_port_india']
             );
+
             const formCStatus = evaluateServiceStage(
               item.status,
               extractedData,
               guest.form_c_path,
+              'welcome_form',
               ['permanent_address', 'contact_email', 'contact_phone', 'arrived_from', 'proceeding_to']
             );
 
@@ -477,8 +525,17 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
                   👤 Guest {idx + 1} Pipeline Services:
                 </Text>
                 <View style={styles.stagePillsGrid}>
-                  {renderStagePill('1. Passport / MRZ', passportStatus)}
-                  {renderStagePill('2. Visa / OCI', visaStatus)}
+                  {renderStagePill('1. Passport Bio', passportStatus)}
+
+                  {/* Render Visa Doc pill if attached */}
+                  {guest.visa_document_path && renderStagePill('2A. Visa Doc', visaDocStatus)}
+
+                  {/* Render Visa Stamp pill if attached */}
+                  {guest.visa_stamp_path && renderStagePill('2B. Visa Stamp', visaStampStatus)}
+
+                  {/* If neither visa is attached, render single fallback pill */}
+                  {!guest.visa_document_path && !guest.visa_stamp_path && renderStagePill('2. Visa', 'NOT_ATTACHED')}
+
                   {renderStagePill('3. Entry Stamp', stampStatus)}
                   {renderStagePill('4. Form-C Report', formCStatus)}
                 </View>
@@ -487,16 +544,18 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
           })}
         </View>
 
-        {/* Action Buttons */}
+        {/* Submission-Level Action Footer (Task 43 & 44) */}
         <View style={[styles.cardFooterActions, { borderTopColor: colors.border }]}>
           {isThisCardActive ? (
             <View style={styles.centeredRow}>
-              <ActivityIndicator size="small" color={colors.accent} />
-              <Text style={[styles.processingText, { color: colors.accent }]}> Submitting bundle...</Text>
+              <ActivityIndicator size="small" color={colors.primaryBrand} />
+              <Text style={[styles.processingText, { color: colors.primaryBrand }]}>
+                {' '}Submitting bundle...
+              </Text>
             </View>
           ) : isUploadPending ? (
             <TouchableOpacity onPress={() => handleTriggerReExtract(item)} style={styles.singleActionButton}>
-              <Text style={[styles.actionPromptText, { color: colors.accent }]}>
+              <Text style={[styles.actionPromptText, { color: colors.primaryBrand }]}>
                 Tap to Send Submission for Extraction ⟳
               </Text>
             </TouchableOpacity>
@@ -509,51 +568,48 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
             </View>
           ) : isReadyForReview ? (
             <View style={styles.splitActionRow}>
+              {/* Submission-level Re-run */}
               <TouchableOpacity
                 onPress={() => handleTriggerReExtract(item)}
                 style={[styles.smallButton, { backgroundColor: colors.surfaceSubtle, borderColor: colors.border }]}
               >
-                <Text style={[styles.smallButtonText, { color: colors.textMuted }]}>⟳ Re-run All</Text>
+                <Text style={[styles.smallButtonText, { color: colors.textMuted }]}>⟳ Re-run</Text>
               </TouchableOpacity>
 
-              <TouchableOpacity
-                onPress={() => onOpenReview(item.id)}
-                style={[styles.smallButton, { backgroundColor: colors.statusReady, marginLeft: 8 }]}
-              >
-                <Text style={[styles.smallButtonText, { color: '#FFFFFF', fontWeight: '700' }]}>
-                  Verify Details →
-                </Text>
-              </TouchableOpacity>
-            </View>
-          ) : isReviewed ? (
-            <View style={styles.splitActionRow}>
-              <TouchableOpacity
-                onPress={() => handleTriggerReExtract(item)}
-                style={[styles.smallButton, { backgroundColor: colors.surfaceSubtle, borderColor: colors.border }]}
-              >
-                <Text style={[styles.smallButtonText, { color: colors.textMuted }]}>⟳ Re-run All</Text>
-              </TouchableOpacity>
-
+              {/* Review & Edit */}
               <TouchableOpacity
                 onPress={() => onOpenReview(item.id)}
                 style={[styles.smallButton, { backgroundColor: colors.surfaceSubtle, borderColor: colors.border, marginLeft: 8 }]}
               >
-                <Text style={[styles.smallButtonText, { color: colors.textPrimary }]}>✏️ Edit</Text>
+                <Text style={[styles.smallButtonText, { color: colors.textPrimary }]}>✏️ Review</Text>
               </TouchableOpacity>
 
+              {/* Task 44: Delete Submission */}
               <TouchableOpacity
-                onPress={() => onOpenPortal(item.id)}
-                style={[styles.smallButton, { backgroundColor: colors.primaryBrand, marginLeft: 8 }]}
+                onPress={() => handleDeleteSubmission(item.id)}
+                disabled={isThisCardDeleting}
+                style={[styles.smallButton, { backgroundColor: '#FEE2E2', borderColor: '#FCA5A5', marginLeft: 8 }]}
               >
-                <Text style={[styles.smallButtonText, { color: '#FFFFFF', fontWeight: '700' }]}>
-                  🚀 Portal
-                </Text>
+                {isThisCardDeleting ? (
+                  <ActivityIndicator size="small" color="#EF4444" />
+                ) : (
+                  <Text style={[styles.smallButtonText, { color: '#B91C1C' }]}>🗑 Delete</Text>
+                )}
               </TouchableOpacity>
             </View>
           ) : (
-            <Text style={[styles.actionPromptText, { color: colors.textMuted }]}>
-              {item.status}
-            </Text>
+            <View style={styles.splitActionRow}>
+              <Text style={[styles.actionPromptText, { color: colors.textMuted }]}>
+                {item.status}
+              </Text>
+              <TouchableOpacity
+                onPress={() => handleDeleteSubmission(item.id)}
+                disabled={isThisCardDeleting}
+                style={[styles.smallButton, { backgroundColor: '#FEE2E2', borderColor: '#FCA5A5', marginLeft: 8 }]}
+              >
+                <Text style={[styles.smallButtonText, { color: '#B91C1C' }]}>🗑 Delete</Text>
+              </TouchableOpacity>
+            </View>
           )}
         </View>
       </View>
@@ -562,6 +618,7 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
 
   return (
     <View style={[styles.container, { backgroundColor: colors.background }]}>
+      {/* Top Navigation & App Bar */}
       <View
         style={[
           styles.topBar,
@@ -588,6 +645,7 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
         </View>
       </View>
 
+      {/* Submissions List */}
       {loading ? (
         <View style={styles.centerContainer}>
           <ActivityIndicator size="large" color={colors.primaryBrand} />
@@ -608,115 +666,96 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
           }
           ListEmptyComponent={
             <View style={styles.emptyContainer}>
-              <Text style={[styles.emptyTitle, { color: colors.textPrimary }]}>No captures yet</Text>
+              <Text style={[styles.emptyTitle, { color: colors.textPrimary }]}>No Submissions Yet</Text>
               <Text style={[styles.emptySubtitle, { color: colors.textMuted }]}>
-                Tap the button below to capture the guest documents.
+                Tap the button below to capture identity documents and arrival slips for a new guest check-in.
               </Text>
             </View>
           }
         />
       )}
 
-      <View
-        style={[
-          styles.bottomBarContainer,
-          { backgroundColor: colors.surface, borderTopColor: colors.border },
-        ]}
-      >
+      {/* Floating Bottom Button: Capture New Guest */}
+      <View style={[styles.bottomBarContainer, { backgroundColor: colors.surface, borderTopColor: colors.border }]}>
         <TouchableOpacity
-          onPress={onStartNewCapture}
           style={[styles.primaryActionButton, { backgroundColor: colors.primaryBrand }]}
+          onPress={onStartNewCapture}
         >
-          <Text style={styles.primaryActionText}>+ New Guest Capture</Text>
+          <Text style={styles.primaryActionText}>+ Capture New Guest Check-In</Text>
         </TouchableOpacity>
       </View>
 
-      <Modal
-        visible={isCredsModalVisible}
-        transparent={true}
-        animationType="fade"
-        onRequestClose={() => setIsCredsModalVisible(false)}
-      >
+      {/* Credentials Modal */}
+      <Modal visible={isCredsModalVisible} transparent animationType="fade">
         <View style={styles.modalOverlay}>
-          <View
-            style={[
-              styles.modalDialog,
-              { backgroundColor: colors.surface, borderColor: colors.border },
-            ]}
-          >
-            <Text style={[styles.modalTitle, { color: colors.textPrimary }]}>
-              Form-C Portal Credentials
-            </Text>
+          <View style={[styles.modalDialog, { backgroundColor: colors.surface, borderColor: colors.border }]}>
+            <Text style={[styles.modalTitle, { color: colors.textPrimary }]}>Form-C Portal Login</Text>
             <Text style={[styles.modalSubtitle, { color: colors.textMuted }]}>
-              Stored encrypted on device using Android Keystore.
+              Stored in Android Keystore for secure verification.
             </Text>
 
             <View style={styles.modalFieldGroup}>
-              <Text style={[styles.modalLabel, { color: colors.textPrimary }]}>Portal User ID</Text>
+              <Text style={[styles.modalLabel, { color: colors.textMuted }]}>User ID</Text>
               <TextInput
                 style={[
                   styles.modalInput,
                   {
-                    backgroundColor: colors.surfaceSubtle,
                     color: colors.textPrimary,
                     borderColor: colors.border,
+                    backgroundColor: colors.surfaceSubtle,
                   },
                 ]}
-                placeholder="e.g. KER_KOC_00123"
-                placeholderTextColor={colors.textMuted}
-                autoCapitalize="none"
                 value={portalUserId}
                 onChangeText={setPortalUserId}
+                autoCapitalize="none"
+                placeholder="Enter Portal User ID"
+                placeholderTextColor={colors.textMuted}
               />
             </View>
 
             <View style={styles.modalFieldGroup}>
-              <Text style={[styles.modalLabel, { color: colors.textPrimary }]}>Portal Password</Text>
+              <Text style={[styles.modalLabel, { color: colors.textMuted }]}>Password</Text>
               <TextInput
                 style={[
                   styles.modalInput,
                   {
-                    backgroundColor: colors.surfaceSubtle,
                     color: colors.textPrimary,
                     borderColor: colors.border,
+                    backgroundColor: colors.surfaceSubtle,
                   },
                 ]}
-                placeholder="Enter password"
-                placeholderTextColor={colors.textMuted}
-                secureTextEntry={true}
-                autoCapitalize="none"
                 value={portalPassword}
                 onChangeText={setPortalPassword}
+                secureTextEntry
+                placeholder="Enter Portal Password"
+                placeholderTextColor={colors.textMuted}
               />
             </View>
 
             <View style={styles.modalActionsRow}>
               <TouchableOpacity
                 onPress={handleClearCredentials}
-                style={[styles.modalActionButton, { backgroundColor: colors.statusPending }]}
+                style={[styles.modalActionButton, { backgroundColor: '#FEE2E2' }]}
               >
-                <Text style={styles.modalActionText}>Clear</Text>
+                <Text style={[styles.modalActionText, { color: '#EF4444' }]}>Clear</Text>
               </TouchableOpacity>
 
               <TouchableOpacity
                 onPress={() => setIsCredsModalVisible(false)}
-                style={[
-                  styles.modalActionButton,
-                  { backgroundColor: colors.surfaceSubtle, borderColor: colors.border, borderWidth: 1 },
-                ]}
+                style={[styles.modalActionButton, { backgroundColor: colors.surfaceSubtle }]}
               >
                 <Text style={[styles.modalActionText, { color: colors.textPrimary }]}>Cancel</Text>
               </TouchableOpacity>
 
               <TouchableOpacity
-                disabled={isSavingCreds}
                 onPress={handleSaveCredentials}
+                disabled={isSavingCreds}
                 style={[styles.modalActionButton, { backgroundColor: colors.primaryBrand }]}
               >
                 {isSavingCreds ? (
-                  <ActivityIndicator color="#FFFFFF" size="small" />
+                  <ActivityIndicator size="small" color="#FFFFFF" />
                 ) : (
-                  <Text style={styles.modalActionText}>Save</Text>
+                  <Text style={[styles.modalActionText, { color: '#FFFFFF' }]}>Save</Text>
                 )}
               </TouchableOpacity>
             </View>
@@ -955,7 +994,6 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   modalActionText: {
-    color: '#FFFFFF',
     fontSize: 14,
     fontWeight: '600',
   },
