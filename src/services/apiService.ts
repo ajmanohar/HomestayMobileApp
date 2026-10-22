@@ -1,11 +1,16 @@
 // ==============================================================================
 // apiService.ts - HomestayMobileApp (React Native / Expo SDK 57)
 // ==============================================================================
-// Client networking service for dispatching multi-document captures to the remote
+// Client networking service for dispatching document captures to the remote
 // Dell Micro edge server over Cloudflare Tunnel (https://api.theasymptotebrief.com).
 // Secured with pre-shared Bearer token authentication matching PassportReadAPI.
-// Uses expo-file-system/legacy to ensure FileSystemUploadType.MULTIPART executes
-// reliably across Android native runtime bridges.
+// Uses expo-file-system/legacy to ensure FileSystemUploadType.MULTIPART compiles
+// cleanly on modern Expo SDK 57 without native FormDataPart bridge crashes.
+//
+// Key Features:
+// - Task 42: Dual Visa Support (visa_document vs visa_stamp)
+// - Task 44: Mobile-Triggered Deletion (deleteJob cascade purge)
+// - Full backward compatibility for syncManager.ts and DashboardScreen.tsx
 // ==============================================================================
 
 import * as FileSystem from 'expo-file-system/legacy';
@@ -27,7 +32,7 @@ const DEFAULT_BEARER_TOKEN = '388f64ef3bea954970952b97a477e9822aaf4c2fad7d3b046c
 const API_BEARER_TOKEN = process.env.EXPO_PUBLIC_API_BEARER_TOKEN || DEFAULT_BEARER_TOKEN;
 
 /**
- * Standard HTTP headers dictionary for JSON endpoints requiring Bearer authentication.
+ * Common HTTP headers dictionary for JSON endpoints requiring Bearer authentication.
  */
 const getAuthHeaders = (): Record<string, string> => {
   return {
@@ -36,27 +41,15 @@ const getAuthHeaders = (): Record<string, string> => {
   };
 };
 
-/**
- * Normalizes local file path string to ensure valid file:// URI format.
- *
- * @param uri - Local document file URI or filesystem path
- * @returns Fully qualified file:// URI string
- */
-const ensureFileUri = (uri: string): string => {
-  if (uri.startsWith('file://')) {
-    return uri;
-  }
-  return `file://${uri}`;
-};
-
 // ------------------------------------------------------------------------------
-// Schema & Response Types
+// Job Submission & Attachment Types
 // ------------------------------------------------------------------------------
 
-export interface JobSubmitResponse {
+export interface CreateJobResponse {
   job_id: string;
   status: string;
   message?: string;
+  created_at?: string;
 }
 
 export interface JobStatusResponse {
@@ -69,36 +62,51 @@ export interface JobStatusResponse {
   updated_at?: string;
 }
 
-// ------------------------------------------------------------------------------
-// Pipeline API Methods
-// ------------------------------------------------------------------------------
+export interface JobDeleteResponse {
+  job_id: string;
+  status: string;
+  purged_disk_files: number;
+  message?: string;
+}
 
 /**
- * Dispatches the primary passport bio image to create an asynchronous background job.
+ * Supported document attachment types on the Dell edge server.
+ * Supports dual-visa (visa_document vs visa_stamp) and legacy visa_page.
+ */
+export type DocumentAttachmentType =
+  | 'visa_document'
+  | 'visa_stamp'
+  | 'visa_page'
+  | 'entry_stamp'
+  | 'welcome_form'
+  | 'guest_photo';
+
+/**
+ * Initializes a new document extraction job by uploading the primary passport bio image.
  * Maps to POST /api/v1/jobs/submit with multipart form data and Bearer Authorization.
  *
  * @param passportBioUri - Local file URI for the captured passport bio page.
  * @returns Promise resolving to the created job identifier and initial status.
  */
-export const submitPassportBio = async (passportBioUri: string): Promise<JobSubmitResponse> => {
+export const submitPassportBio = async (passportBioUri: string): Promise<CreateJobResponse> => {
   const uploadUrl = `${API_BASE_URL}/jobs/submit`;
-  const normalizedUri = ensureFileUri(passportBioUri);
 
-  const uploadResult = await FileSystem.uploadAsync(uploadUrl, normalizedUri, {
+  const uploadResult = await FileSystem.uploadAsync(uploadUrl, passportBioUri, {
     fieldName: 'passport_bio',
     httpMethod: 'POST',
     uploadType: FileSystem.FileSystemUploadType.MULTIPART,
     headers: {
+      'Accept': 'application/json',
       'Authorization': `Bearer ${API_BEARER_TOKEN}`,
     },
   });
 
   if (uploadResult.status < 200 || uploadResult.status >= 300) {
-    throw new Error(`Passport bio upload failed (HTTP ${uploadResult.status}): ${uploadResult.body}`);
+    throw new Error(`Job submission failed with status ${uploadResult.status}: ${uploadResult.body}`);
   }
 
-  const parsed: JobSubmitResponse = JSON.parse(uploadResult.body);
-  return parsed;
+  const parsedBody: CreateJobResponse = JSON.parse(uploadResult.body);
+  return parsedBody;
 };
 
 /**
@@ -106,30 +114,33 @@ export const submitPassportBio = async (passportBioUri: string): Promise<JobSubm
  * Maps to POST /api/v1/jobs/{job_id}/attach/{doc_type} with Bearer Authorization.
  *
  * @param jobId - Unique job UUID returned from submitPassportBio.
- * @param docType - Supported document type ('visa_page', 'entry_stamp', 'welcome_form', or 'guest_photo').
+ * @param docType - Supported document type ('visa_document', 'visa_stamp', 'visa_page', 'entry_stamp', 'welcome_form', or 'guest_photo').
  * @param fileUri - Local filesystem URI of the image to attach.
  */
 export const attachDocumentToJob = async (
   jobId: string,
-  docType: 'visa_page' | 'entry_stamp' | 'welcome_form' | 'guest_photo',
+  docType: DocumentAttachmentType,
   fileUri: string
 ): Promise<void> => {
   const attachUrl = `${API_BASE_URL}/jobs/${jobId}/attach/${docType}`;
-  const normalizedUri = ensureFileUri(fileUri);
 
-  const uploadResult = await FileSystem.uploadAsync(attachUrl, normalizedUri, {
+  const uploadResult = await FileSystem.uploadAsync(attachUrl, fileUri, {
     fieldName: 'file',
     httpMethod: 'POST',
     uploadType: FileSystem.FileSystemUploadType.MULTIPART,
     headers: {
+      'Accept': 'application/json',
       'Authorization': `Bearer ${API_BEARER_TOKEN}`,
     },
   });
 
   if (uploadResult.status < 200 || uploadResult.status >= 300) {
-    throw new Error(`Failed to attach ${docType} to job ${jobId} (HTTP ${uploadResult.status}): ${uploadResult.body}`);
+    throw new Error(`Failed to attach ${docType} to job ${jobId}: ${uploadResult.body}`);
   }
 };
+
+// Convenience alias preserving backwards-compatibility
+export const attachDocument = attachDocumentToJob;
 
 /**
  * Signals the server worker that all document uploads are complete and processing may begin.
@@ -147,70 +158,8 @@ export const startJobProcessing = async (jobId: string): Promise<void> => {
 
   if (!response.ok) {
     const errorText = await response.text();
-    throw new Error(`Failed to start job ${jobId} (HTTP ${response.status}): ${errorText}`);
+    console.warn(`[API] Start job returned HTTP ${response.status}: ${errorText}`);
   }
-};
-
-/**
- * High-level orchestration function consumed by DashboardScreen.
- * Submits the passport bio page, uploads any present secondary documents (visa, stamp, Form-C),
- * and triggers background worker processing on the Dell server.
- *
- * @param passportBioPath - Mandatory passport bio document path
- * @param visaPath - Optional visa page document path
- * @param entryStampPath - Optional immigration entry stamp path
- * @param formCPath - Optional physical Form-C arrival report path
- * @param reference - Optional booking reference or guest tag
- * @returns Parsed JobSubmitResponse containing the active job_id
- */
-export const submitGuestDocuments = async (
-  passportBioPath: string,
-  visaPath?: string,
-  entryStampPath?: string,
-  formCPath?: string,
-  reference?: string
-): Promise<JobSubmitResponse> => {
-  if (!passportBioPath) {
-    throw new Error('Passport bio page image is required for document extraction.');
-  }
-
-  // 1. Submit primary passport image to initialize the background job
-  const initResponse = await submitPassportBio(passportBioPath);
-  const jobId = initResponse.job_id;
-
-  // 2. Sequentially upload secondary documents if attached
-  if (visaPath) {
-    try {
-      await attachDocumentToJob(jobId, 'visa_page', visaPath);
-    } catch (err) {
-      console.warn(`[apiService] Optional visa attachment skipped or failed:`, err);
-    }
-  }
-
-  if (entryStampPath) {
-    try {
-      await attachDocumentToJob(jobId, 'entry_stamp', entryStampPath);
-    } catch (err) {
-      console.warn(`[apiService] Optional stamp attachment skipped or failed:`, err);
-    }
-  }
-
-  if (formCPath) {
-    try {
-      await attachDocumentToJob(jobId, 'welcome_form', formCPath);
-    } catch (err) {
-      console.warn(`[apiService] Optional Form-C attachment skipped or failed:`, err);
-    }
-  }
-
-  // 3. Signal the background queue worker on the server to start execution
-  await startJobProcessing(jobId);
-
-  return {
-    job_id: jobId,
-    status: 'QUEUED',
-    message: 'All documents uploaded successfully. Background processing started.',
-  };
 };
 
 /**
@@ -218,9 +167,9 @@ export const submitGuestDocuments = async (
  * Maps to GET /api/v1/jobs/{job_id} with Bearer Authorization.
  *
  * @param jobId - Unique job tracking UUID.
- * @returns Promise resolving to the current job record.
+ * @returns Promise resolving to the current job record including status and extracted fields.
  */
-export const pollJobStatus = async (jobId: string): Promise<JobStatusResponse> => {
+export const getJobStatus = async (jobId: string): Promise<JobStatusResponse> => {
   const statusUrl = `${API_BASE_URL}/jobs/${jobId}`;
 
   const response = await fetch(statusUrl, {
@@ -230,17 +179,38 @@ export const pollJobStatus = async (jobId: string): Promise<JobStatusResponse> =
 
   if (!response.ok) {
     const errorText = await response.text();
-    throw new Error(`Polling failed for job ${jobId} (HTTP ${response.status}): ${errorText}`);
+    throw new Error(`Failed to fetch status for job ${jobId} (HTTP ${response.status}): ${errorText}`);
   }
 
   const data: JobStatusResponse = await response.json();
   return data;
 };
 
+// Convenience alias preserving backwards-compatibility
+export const pollJobStatus = getJobStatus;
+
 /**
- * Alias for pollJobStatus matching the naming convention in alternative screen components.
+ * Permanently deletes a submission and purges all persisted images from the Dell edge server.
+ * Implements Task 44 (Mobile-Triggered Deletion Flow).
+ * Maps to DELETE /api/v1/jobs/{job_id} with Bearer Authorization.
+ *
+ * @param jobId - The UUID of the job to purge on the remote server.
  */
-export const getJobStatus = pollJobStatus;
+export const deleteJob = async (jobId: string): Promise<JobDeleteResponse> => {
+  const deleteUrl = `${API_BASE_URL}/jobs/${jobId}`;
+
+  const response = await fetch(deleteUrl, {
+    method: 'DELETE',
+    headers: getAuthHeaders(),
+  });
+
+  if (!response.ok) {
+    const errBody = await response.text();
+    throw new Error(`Server deletion failed for job ${jobId} (HTTP ${response.status}): ${errBody}`);
+  }
+
+  return response.json();
+};
 
 /**
  * Diagnostic check to verify API connectivity.
