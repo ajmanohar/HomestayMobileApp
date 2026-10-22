@@ -185,9 +185,12 @@ export const CaptureScreen: React.FC<CaptureScreenProps> = ({ onCaptureComplete,
         persistedPaths[key] = destUri;
       }
 
+      // Normalize reference to string | null
+      const cleanReference = reference.trim().length > 0 ? reference.trim() : null;
+
       const newSubmission: SubmissionRecord = {
         id: submissionId,
-        reference: reference.trim().length > 0 ? reference.trim() : undefined,
+        reference: cleanReference,
         guest_count: 1,
         status: 'UPLOAD_PENDING',
         created_at: now,
@@ -203,6 +206,7 @@ export const CaptureScreen: React.FC<CaptureScreenProps> = ({ onCaptureComplete,
         entry_stamp_path: persistedPaths['stamp'],
         form_c_path: persistedPaths['form_c'],
         guest_photo_path: persistedPaths['guest_photo'],
+        created_at: now,
       };
 
       await insertSubmission(newSubmission, [newGuestDoc]);
