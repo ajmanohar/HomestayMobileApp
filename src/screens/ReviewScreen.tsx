@@ -5,13 +5,15 @@
 // editable Form-C field inputs.
 //
 // Lifecycle Constraints (Task 43):
-// - Mobile application lifecycle ends at Review & Re-submit.
+// - Mobile application lifecycle ends strictly at Review & Re-submit.
 // - Portal auto-submission is removed from mobile.
 //
 // Features:
 // - Task 42: Dual Visa inspection tabs (e-Visa Document vs. Passport Visa Stamp).
 // - Task 44: Mobile-Triggered Deletion with cascade purge to Dell edge server.
 // - Task 45: Isolated per-document field viewing and editing.
+// - Task 48: Explicit (DD-MM-YYYY) labels on every date field and guaranteed
+//   persistence of manual operator overrides into SQLite.
 // ==============================================================================
 
 import React, { useState, useEffect, useCallback } from 'react';
@@ -173,7 +175,7 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
             const wForm = docsContainer.welcome_form || parsed;
 
             setFormData({
-              // Passport
+              // Passport Bio
               surname: extractVal(pBio.surname),
               givenNames: extractVal(pBio.given_names),
               sex: extractVal(pBio.sex),
@@ -226,7 +228,6 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
 
   /**
    * Resolves the active image URI based on the selected document tab.
-   * Defensively normalizes with '?? null' to prevent undefined assignment errors.
    */
   const getActiveImageUri = (): string | null => {
     if (!guestDoc) return null;
@@ -257,7 +258,7 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
   };
 
   /**
-   * Saves reviewed / edited data to local SQLite.
+   * Task 48: Overwrites AI data with manual operator edits and persists to SQLite.
    */
   const handleSave = async (showNotice: boolean = true) => {
     try {
@@ -289,13 +290,50 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
         purpose_of_visit: { value: formData.purposeOfVisit, confidence: 1.0, source: 'manual_edit' },
         expected_departure_date: { value: formData.expectedDepartureDate, confidence: 1.0, source: 'manual_edit' },
         arrived_country_city_india: { value: formData.arrivedCountryCityIndia, confidence: 1.0, source: 'manual_edit' },
+        // Maintain per-document container structure with manual overrides
+        documents: {
+          passport_bio: {
+            surname: { value: formData.surname, confidence: 1.0, source: 'manual_edit' },
+            given_names: { value: formData.givenNames, confidence: 1.0, source: 'manual_edit' },
+            sex: { value: formData.sex, confidence: 1.0, source: 'manual_edit' },
+            date_of_birth: { value: formData.dateOfBirth, confidence: 1.0, source: 'manual_edit' },
+            nationality: { value: formData.nationality, confidence: 1.0, source: 'manual_edit' },
+            passport_number: { value: formData.passportNumber, confidence: 1.0, source: 'manual_edit' },
+            passport_expiry_date: { value: formData.passportExpiryDate, confidence: 1.0, source: 'manual_edit' },
+          },
+          visa_stamp: {
+            visa_number: { value: formData.visaNumber, confidence: 1.0, source: 'manual_edit' },
+            visa_type: { value: formData.visaType, confidence: 1.0, source: 'manual_edit' },
+            visa_issue_date: { value: formData.visaIssueDate, confidence: 1.0, source: 'manual_edit' },
+            visa_expiry_date: { value: formData.visaExpiryDate, confidence: 1.0, source: 'manual_edit' },
+            visa_place_of_issue: { value: formData.visaPlaceOfIssue, confidence: 1.0, source: 'manual_edit' },
+          },
+          entry_stamp: {
+            arrival_date_india: { value: formData.arrivalDateIndia, confidence: 1.0, source: 'manual_edit' },
+            arrival_port_india: { value: formData.arrivalPortIndia, confidence: 1.0, source: 'manual_edit' },
+          },
+          welcome_form: {
+            permanent_address: { value: formData.permanentAddress, confidence: 1.0, source: 'manual_edit' },
+            city: { value: formData.city, confidence: 1.0, source: 'manual_edit' },
+            country: { value: formData.country, confidence: 1.0, source: 'manual_edit' },
+            contact_email: { value: formData.contactEmail, confidence: 1.0, source: 'manual_edit' },
+            contact_phone: { value: formData.contactPhone, confidence: 1.0, source: 'manual_edit' },
+            arrival_datetime_homestay: { value: formData.arrivalDatetimeHomestay, confidence: 1.0, source: 'manual_edit' },
+            arrived_from: { value: formData.arrivedFrom, confidence: 1.0, source: 'manual_edit' },
+            proceeding_to: { value: formData.proceedingTo, confidence: 1.0, source: 'manual_edit' },
+            stay_duration_india: { value: formData.stayDurationIndia, confidence: 1.0, source: 'manual_edit' },
+            purpose_of_visit: { value: formData.purposeOfVisit, confidence: 1.0, source: 'manual_edit' },
+            expected_departure_date: { value: formData.expectedDepartureDate, confidence: 1.0, source: 'manual_edit' },
+            arrived_country_city_india: { value: formData.arrivedCountryCityIndia, confidence: 1.0, source: 'manual_edit' },
+          },
+        },
       };
 
       await updateGuestExtractedData(submissionId, JSON.stringify(updatedPayload));
-      await updateSubmissionStatus(submissionId, 'PENDING_REVIEW');
+      await updateSubmissionStatus(submissionId, 'REVIEWED');
 
       if (showNotice) {
-        Alert.alert('Saved', 'Guest Form-C details successfully updated locally.');
+        Alert.alert('Saved', 'Guest Form-C details successfully updated locally and ready for desktop retrieval.');
       }
     } catch (err: any) {
       Alert.alert('Save Failed', err.message || 'Could not save guest record.');
@@ -315,11 +353,9 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
 
     try {
       setReSubmitting(true);
-      // 1. Submit passport bio to initialize new job
       const submitRes = await submitPassportBio(guestDoc.passport_bio_path);
       const newJobId = submitRes.job_id;
 
-      // 2. Attach optional secondary captures
       if (guestDoc.visa_document_path) {
         await attachDocumentToJob(newJobId, 'visa_document', guestDoc.visa_document_path);
       }
@@ -336,10 +372,8 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
         await attachDocumentToJob(newJobId, 'guest_photo', guestDoc.guest_photo_path);
       }
 
-      // 3. Trigger worker
       await startJobProcessing(newJobId);
 
-      // 4. Update local SQLite status
       const db = await openDatabase();
       await db.runAsync('UPDATE submissions SET status = ?, job_id = ? WHERE id = ?;', [
         'PROCESSING',
@@ -400,7 +434,7 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
     onComplete();
   };
 
-  // Helper to render an outlined editable text input
+  // Helper to render an outlined editable text input with explicit format hints
   const renderField = (label: string, fieldKey: keyof FormCData, placeholder: string = '') => (
     <View style={styles.fieldContainer} key={fieldKey}>
       <Text style={[styles.fieldLabel, { color: colors.textMuted }]}>{label}</Text>
@@ -543,19 +577,19 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
         </TouchableOpacity>
       </ScrollView>
 
-      {/* --- Bottom 60%: Tab-Scoped Editable Form Fields --- */}
+      {/* --- Bottom 60%: Tab-Scoped Editable Form Fields with Explicit Date Labels (Task 48) --- */}
       <ScrollView style={styles.fieldsScroll} contentContainerStyle={styles.fieldsContainer}>
         {/* PASSPORT FIELDS */}
         {(selectedDocTab === 'passport' || selectedDocTab === 'all') && (
           <View style={styles.formSection}>
             <Text style={[styles.sectionHeading, { color: colors.primaryBrand }]}>Passport Bio-Data</Text>
-            {renderField('Surname (Family Name)', 'surname')}
-            {renderField('Given Name(s)', 'givenNames')}
-            {renderField('Passport Number', 'passportNumber')}
-            {renderField('Nationality', 'nationality')}
-            {renderField('Date of Birth (YYYY-MM-DD)', 'dateOfBirth')}
-            {renderField('Sex (M / F / X)', 'sex')}
-            {renderField('Passport Expiry Date (YYYY-MM-DD)', 'passportExpiryDate')}
+            {renderField('Surname (Family Name)', 'surname', 'e.g. DOE')}
+            {renderField('Given Name(s)', 'givenNames', 'e.g. JOHN')}
+            {renderField('Passport Number', 'passportNumber', 'e.g. C92PJR1W2')}
+            {renderField('Nationality', 'nationality', 'e.g. DEUTSCH or GERMANY')}
+            {renderField('Date of Birth (DD-MM-YYYY)', 'dateOfBirth', 'DD-MM-YYYY')}
+            {renderField('Sex (M / F / X)', 'sex', 'M, F, or X')}
+            {renderField('Passport Expiry Date (DD-MM-YYYY)', 'passportExpiryDate', 'DD-MM-YYYY')}
           </View>
         )}
 
@@ -565,11 +599,11 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
             <Text style={[styles.sectionHeading, { color: colors.primaryBrand }]}>
               {selectedDocTab === 'visa_document' ? 'e-Visa Document Details' : 'Visa Stamp / Sticker Details'}
             </Text>
-            {renderField('Visa Number', 'visaNumber')}
-            {renderField('Visa Type', 'visaType')}
-            {renderField('Issue Date (YYYY-MM-DD)', 'visaIssueDate')}
-            {renderField('Expiry Date (YYYY-MM-DD)', 'visaExpiryDate')}
-            {renderField('Place of Issue / Authority', 'visaPlaceOfIssue')}
+            {renderField('Visa Number', 'visaNumber', 'e.g. H26V04876')}
+            {renderField('Visa Type', 'visaType', 'TOURIST, BUSINESS, etc.')}
+            {renderField('Visa Issue Date (DD-MM-YYYY)', 'visaIssueDate', 'DD-MM-YYYY')}
+            {renderField('Visa Expiry Date (DD-MM-YYYY)', 'visaExpiryDate', 'DD-MM-YYYY')}
+            {renderField('Place of Issue / Authority', 'visaPlaceOfIssue', 'e.g. Berlin or Online')}
           </View>
         )}
 
@@ -577,8 +611,8 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
         {(selectedDocTab === 'stamp' || selectedDocTab === 'all') && (
           <View style={styles.formSection}>
             <Text style={[styles.sectionHeading, { color: colors.primaryBrand }]}>Immigration Arrival Stamp</Text>
-            {renderField('Date of Arrival in India (YYYY-MM-DD)', 'arrivalDateIndia')}
-            {renderField('Port or Airport of Arrival', 'arrivalPortIndia')}
+            {renderField('Date of Arrival in India (DD-MM-YYYY)', 'arrivalDateIndia', 'DD-MM-YYYY')}
+            {renderField('Port or Airport of Arrival', 'arrivalPortIndia', 'e.g. COCHIN AIRPORT, MUMBAI')}
           </View>
         )}
 
@@ -586,18 +620,18 @@ export const ReviewScreen: React.FC<ReviewScreenProps> = ({
         {(selectedDocTab === 'form_c' || selectedDocTab === 'all') && (
           <View style={styles.formSection}>
             <Text style={[styles.sectionHeading, { color: colors.primaryBrand }]}>Form-C Arrival Report (Rows 1-12)</Text>
-            {renderField('Row 2: Full Permanent Street Address', 'permanentAddress')}
-            {renderField('Row 2: Home City / Town', 'city')}
-            {renderField('Row 2: Home Country', 'country')}
-            {renderField('Row 2: Contact Email', 'contactEmail')}
-            {renderField('Row 2: Telephone / Mobile', 'contactPhone')}
-            {renderField('Row 6: Date & Time of Arrival in Homestay', 'arrivalDatetimeHomestay')}
-            {renderField('Row 7: Arrived From', 'arrivedFrom')}
-            {renderField('Row 8: Proceeding To', 'proceedingTo')}
-            {renderField('Row 9: Proposed Stay Duration in India', 'stayDurationIndia')}
-            {renderField('Row 10: Purpose of Visit & Profession', 'purposeOfVisit')}
-            {renderField('Row 11: Expected Date of Departure', 'expectedDepartureDate')}
-            {renderField('Row 12: Country & City Arrived to India', 'arrivedCountryCityIndia')}
+            {renderField('Row 2: Full Permanent Street Address', 'permanentAddress', 'Street address in home country')}
+            {renderField('Row 2: Home City / Town', 'city', 'Foreign city')}
+            {renderField('Row 2: Home Country', 'country', 'Foreign country')}
+            {renderField('Row 2: Contact Email', 'contactEmail', 'guest@example.com')}
+            {renderField('Row 2: Telephone / Mobile', 'contactPhone', '+49 ...')}
+            {renderField('Row 6: Date & Time of Arrival in Homestay (DD-MM-YYYY HH:MM)', 'arrivalDatetimeHomestay', 'DD-MM-YYYY HH:MM')}
+            {renderField('Row 7: Arrived From', 'arrivedFrom', 'Previous city / country')}
+            {renderField('Row 8: Proceeding To', 'proceedingTo', 'Next destination')}
+            {renderField('Row 9: Proposed Stay Duration in India', 'stayDurationIndia', 'e.g. 1 month, 2 weeks')}
+            {renderField('Row 10: Purpose of Visit & Profession', 'purposeOfVisit', 'Tourist, Business, etc.')}
+            {renderField('Row 11: Expected Date of Departure (DD-MM-YYYY)', 'expectedDepartureDate', 'DD-MM-YYYY')}
+            {renderField('Row 12: Country & City Arrived to India', 'arrivedCountryCityIndia', 'e.g. Germany, Munich')}
           </View>
         )}
       </ScrollView>
