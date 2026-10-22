@@ -1,85 +1,75 @@
-/**
- * ReviewScreen.tsx
- * Comprehensive Verification & Edit Screen for Guest Document Extractions.
- *
- * Architecture & Features:
- * - Top 42%: Pinch-to-zoom / pan document preview synchronized to the active document tab.
- * - Strict Tab Isolation: Selectively displays ONLY fields extracted from the active scan
- *   (Passport Bio, Visa/OCI, Entry Stamp, or Handwritten Form-C Rule 14).
- * - Master Portal Tab ('ALL'): Consolidates all 26+ fields into an official Form-C submission view.
- * - Provenance Badges: Visually highlights extraction engine (MRZ vs VLM) and confidence scores.
- * - Native Theme Integration: Fully reactive to light/dark themes via useAppTheme.
- * - Preserves manual overrides and writes updates directly to SQLite via openDatabase.
- */
+// ==============================================================================
+// ReviewScreen.tsx - HomestayMobileApp (React Native / Expo SDK 57)
+// ==============================================================================
+// Verification and review screen with pinch-to-zoom image inspection and
+// editable Form-C field inputs.
+//
+// Lifecycle Constraints (Task 43):
+// - Mobile application lifecycle ends at Review & Re-submit.
+// - Portal auto-submission is removed from mobile.
+//
+// Features:
+// - Task 42: Dual Visa inspection tabs (e-Visa Document vs. Passport Visa Stamp).
+// - Task 44: Mobile-Triggered Deletion with cascade purge to Dell edge server.
+// - Task 45: Isolated per-document field viewing and editing.
+// ==============================================================================
 
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import {
   View,
   Text,
   StyleSheet,
   TouchableOpacity,
-  Image,
-  TextInput,
   ScrollView,
+  TextInput,
+  Image,
   Alert,
   ActivityIndicator,
+  SafeAreaView,
   Dimensions,
-  KeyboardAvoidingView,
-  Platform,
 } from 'react-native';
-
-// Application Theme and Database Providers
 import { useAppTheme } from '../theme/ThemeContext';
-import { openDatabase, updateSubmissionStatus, GuestDocumentRecord } from '../db/database';
-
-const { width: SCREEN_WIDTH } = Dimensions.get('window');
-
-// Available document preview tabs
-export type DocumentTabKey = 'passport' | 'visa' | 'stamp' | 'form_c' | 'photo' | 'all';
+import {
+  openDatabase,
+  getSubmissionById,
+  updateGuestExtractedData,
+  updateSubmissionStatus,
+  deleteSubmissionLocallyAndRemote,
+  GuestDocumentRecord,
+  SubmissionRecord,
+} from '../db/database';
+import { submitPassportBio, attachDocumentToJob, startJobProcessing } from '../services/apiService';
 
 interface ReviewScreenProps {
   submissionId: string;
-  onFinishReview: () => void;
-  onCancel: () => void;
+  onBack: () => void;
+  onComplete: () => void;
 }
 
-/**
- * Metadata descriptor for each Form-C field.
- */
-interface FieldDescriptor {
-  key: keyof CompleteFormCFields;
-  label: string;
-  placeholder: string;
-  documentCategory: 'passport' | 'visa' | 'stamp' | 'form_c';
-  autoCapitalize?: 'none' | 'characters' | 'words' | 'sentences';
-}
+type ActiveDocTab = 'passport' | 'visa_document' | 'visa_stamp' | 'stamp' | 'form_c' | 'photo' | 'all';
 
-/**
- * Complete Form-C Guest Record covering Passport Bio, Visa/OCI, Entry Stamp,
- * and all 12 numbered fields of the Arrival Report (Rule 14).
- */
-export interface CompleteFormCFields {
-  // --- 1. Passport Bio ---
+interface FormCData {
+  // Bio fields
   surname: string;
-  givenName: string;
+  givenNames: string;
   sex: string;
   dateOfBirth: string;
   nationality: string;
   passportNumber: string;
   passportExpiryDate: string;
 
-  // --- 2. Visa / OCI ---
+  // Visa fields
   visaNumber: string;
   visaType: string;
   visaIssueDate: string;
   visaExpiryDate: string;
   visaPlaceOfIssue: string;
 
-  // --- 3. Entry Immigration Stamp ---
+  // Entry stamp fields
   arrivalDateIndia: string;
   arrivalPortIndia: string;
 
-  // --- 4. Handwritten Form-C Arrival Report (Rule 14) ---
+  // Form-C slip fields (Rows 1-12)
   permanentAddress: string;
   city: string;
   country: string;
@@ -94,462 +84,558 @@ export interface CompleteFormCFields {
   arrivedCountryCityIndia: string;
 }
 
-/**
- * Master Registry mapping every field to its originating scan.
- */
-const FIELD_REGISTRY: FieldDescriptor[] = [
-  // 1. Passport Bio Scan Fields
-  { key: 'surname', label: 'Surname (As in Passport)', placeholder: 'e.g. SMITH', documentCategory: 'passport', autoCapitalize: 'characters' },
-  { key: 'givenName', label: 'Given Name(s)', placeholder: 'e.g. JOHN DOE', documentCategory: 'passport', autoCapitalize: 'characters' },
-  { key: 'sex', label: 'Sex / Gender (M / F / X)', placeholder: 'M, F, or X', documentCategory: 'passport', autoCapitalize: 'characters' },
-  { key: 'dateOfBirth', label: 'Date of Birth (YYYY-MM-DD)', placeholder: 'YYYY-MM-DD', documentCategory: 'passport', autoCapitalize: 'none' },
-  { key: 'nationality', label: 'Nationality', placeholder: 'e.g. CANADIAN', documentCategory: 'passport', autoCapitalize: 'characters' },
-  { key: 'passportNumber', label: 'Passport Number', placeholder: 'Alphanumeric passport no.', documentCategory: 'passport', autoCapitalize: 'characters' },
-  { key: 'passportExpiryDate', label: 'Passport Expiration Date', placeholder: 'YYYY-MM-DD', documentCategory: 'passport', autoCapitalize: 'none' },
-
-  // 2. Visa / OCI Scan Fields
-  { key: 'visaNumber', label: 'Visa / OCI Number', placeholder: 'e.g. V1234567', documentCategory: 'visa', autoCapitalize: 'characters' },
-  { key: 'visaType', label: 'Visa Type / Category', placeholder: 'e.g. TOURIST', documentCategory: 'visa', autoCapitalize: 'characters' },
-  { key: 'visaIssueDate', label: 'Visa Issue Date', placeholder: 'YYYY-MM-DD', documentCategory: 'visa', autoCapitalize: 'none' },
-  { key: 'visaExpiryDate', label: 'Visa Expiry Date', placeholder: 'YYYY-MM-DD', documentCategory: 'visa', autoCapitalize: 'none' },
-  { key: 'visaPlaceOfIssue', label: 'Visa Place of Issue', placeholder: 'e.g. OTTAWA', documentCategory: 'visa', autoCapitalize: 'characters' },
-
-  // 3. Entry Immigration Stamp Fields
-  { key: 'arrivalDateIndia', label: 'Date of Arrival in India', placeholder: 'YYYY-MM-DD', documentCategory: 'stamp', autoCapitalize: 'none' },
-  { key: 'arrivalPortIndia', label: 'Port of Arrival in India', placeholder: 'e.g. COCHIN AIRPORT', documentCategory: 'stamp', autoCapitalize: 'characters' },
-
-  // 4. Handwritten Form-C Arrival Report (Rule 14) Fields
-  { key: 'permanentAddress', label: 'Permanent Residential Address Abroad', placeholder: 'Street address in country of residence', documentCategory: 'form_c', autoCapitalize: 'words' },
-  { key: 'city', label: 'City of Residence', placeholder: 'e.g. Toronto', documentCategory: 'form_c', autoCapitalize: 'words' },
-  { key: 'country', label: 'Country of Residence', placeholder: 'e.g. Canada', documentCategory: 'form_c', autoCapitalize: 'words' },
-  { key: 'contactEmail', label: 'Email Address', placeholder: 'guest@example.com', documentCategory: 'form_c', autoCapitalize: 'none' },
-  { key: 'contactPhone', label: 'Telephone / Mobile Number', placeholder: '+1 234 567 8900', documentCategory: 'form_c', autoCapitalize: 'none' },
-  { key: 'arrivalDatetimeHomestay', label: 'Date & Time of Arrival at Homestay', placeholder: 'YYYY-MM-DD HH:MM', documentCategory: 'form_c', autoCapitalize: 'none' },
-  { key: 'arrivedFrom', label: 'Arrived From (Previous Transit / City)', placeholder: 'e.g. London, UK', documentCategory: 'form_c', autoCapitalize: 'words' },
-  { key: 'proceedingTo', label: 'Proceeding To (Next Destination)', placeholder: 'e.g. Munnar, Kerala', documentCategory: 'form_c', autoCapitalize: 'words' },
-  { key: 'stayDurationIndia', label: 'Proposed Duration of Stay in India', placeholder: 'e.g. 14 Days', documentCategory: 'form_c', autoCapitalize: 'words' },
-  { key: 'purposeOfVisit', label: 'Purpose of Visit & Profession', placeholder: 'e.g. Tourism, Teacher', documentCategory: 'form_c', autoCapitalize: 'words' },
-  { key: 'expectedDepartureDate', label: 'Expected Date of Departure', placeholder: 'YYYY-MM-DD', documentCategory: 'form_c', autoCapitalize: 'none' },
-  { key: 'arrivedCountryCityIndia', label: 'Country & City Arrived In India', placeholder: 'e.g. Canada, Toronto', documentCategory: 'form_c', autoCapitalize: 'words' },
-];
+const INITIAL_FORM_DATA: FormCData = {
+  surname: '',
+  givenNames: '',
+  sex: '',
+  dateOfBirth: '',
+  nationality: '',
+  passportNumber: '',
+  passportExpiryDate: '',
+  visaNumber: '',
+  visaType: 'TOURIST',
+  visaIssueDate: '',
+  visaExpiryDate: '',
+  visaPlaceOfIssue: '',
+  arrivalDateIndia: '',
+  arrivalPortIndia: '',
+  permanentAddress: '',
+  city: '',
+  country: '',
+  contactEmail: '',
+  contactPhone: '',
+  arrivalDatetimeHomestay: '',
+  arrivedFrom: '',
+  proceedingTo: '',
+  stayDurationIndia: '',
+  purposeOfVisit: 'Tourist',
+  expectedDepartureDate: '',
+  arrivedCountryCityIndia: '',
+};
 
 export const ReviewScreen: React.FC<ReviewScreenProps> = ({
   submissionId,
-  onFinishReview,
-  onCancel,
+  onBack,
+  onComplete,
 }) => {
-  // Theme context providing dynamic light/dark colors
-  const { colors, isDark, toggleTheme } = useAppTheme();
+  const { colors, isDark } = useAppTheme();
 
-  // Screen state
   const [loading, setLoading] = useState<boolean>(true);
+  const [saving, setSaving] = useState<boolean>(false);
+  const [reSubmitting, setReSubmitting] = useState<boolean>(false);
+  const [deleting, setDeleting] = useState<boolean>(false);
+
+  const [submission, setSubmission] = useState<SubmissionRecord | null>(null);
   const [guestDoc, setGuestDoc] = useState<GuestDocumentRecord | null>(null);
-  const [selectedDocTab, setSelectedDocTab] = useState<DocumentTabKey>('passport');
-  const [isSaving, setIsSaving] = useState<boolean>(false);
-
-  // Field values state
-  const [formData, setFormData] = useState<CompleteFormCFields>({
-    surname: '',
-    givenName: '',
-    sex: '',
-    dateOfBirth: '',
-    nationality: '',
-    passportNumber: '',
-    passportExpiryDate: '',
-
-    visaNumber: '',
-    visaType: '',
-    visaIssueDate: '',
-    visaExpiryDate: '',
-    visaPlaceOfIssue: '',
-
-    arrivalDateIndia: '',
-    arrivalPortIndia: '',
-
-    permanentAddress: '',
-    city: '',
-    country: '',
-    contactEmail: '',
-    contactPhone: '',
-    arrivalDatetimeHomestay: '',
-    arrivedFrom: '',
-    proceedingTo: '',
-    stayDurationIndia: '',
-    purposeOfVisit: '',
-    expectedDepartureDate: '',
-    arrivedCountryCityIndia: '',
-  });
-
-  // Metadata tracking provenance source and confidence scores per field
-  const [metadata, setMetadata] = useState<Record<string, { confidence: number; source: string }>>({});
+  const [formData, setFormData] = useState<FormCData>(INITIAL_FORM_DATA);
+  const [selectedDocTab, setSelectedDocTab] = useState<ActiveDocTab>('passport');
 
   /**
-   * Loads the guest document record and parses extracted JSON on initial mount.
+   * Helper function to extract text values whether flat or wrapped in { value, confidence }.
    */
-  useEffect(() => {
-    const loadDocumentData = async () => {
-      try {
-        setLoading(true);
-        const db = await openDatabase();
-
-        // Query guest document record for this submission
-        const docs = await db.getAllAsync<GuestDocumentRecord>(
-          `SELECT * FROM guest_documents WHERE submission_id = ? ORDER BY guest_index ASC LIMIT 1;`,
-          [submissionId]
-        );
-
-        if (docs.length > 0) {
-          const doc = docs[0];
-          setGuestDoc(doc);
-
-          if (doc.extracted_data_json) {
-            try {
-              const parsed = JSON.parse(doc.extracted_data_json);
-
-              const metaMap: Record<string, { confidence: number; source: string }> = {};
-
-              // Helper function to extract string values and capture provenance metadata
-              const extractField = (fieldObj: any, key: string, fallback: string = ''): string => {
-                if (fieldObj === null || fieldObj === undefined) {
-                  metaMap[key] = { confidence: 0.0, source: 'unassigned' };
-                  return fallback;
-                }
-                if (typeof fieldObj === 'object' && 'value' in fieldObj) {
-                  metaMap[key] = {
-                    confidence: typeof fieldObj.confidence === 'number' ? fieldObj.confidence : 0.80,
-                    source: fieldObj.source || 'qwen2_vl',
-                  };
-                  return fieldObj.value !== null && fieldObj.value !== undefined ? String(fieldObj.value) : fallback;
-                }
-                metaMap[key] = { confidence: 0.80, source: 'raw_string' };
-                return String(fieldObj);
-              };
-
-              setFormData({
-                // Passport fields
-                surname: extractField(parsed.surname || parsed.last_name, 'surname'),
-                givenName: extractField(parsed.given_names || parsed.given_name || parsed.first_name, 'givenName'),
-                sex: extractField(parsed.sex, 'sex'),
-                dateOfBirth: extractField(parsed.date_of_birth || parsed.dob, 'dateOfBirth'),
-                nationality: extractField(parsed.nationality, 'nationality'),
-                passportNumber: extractField(parsed.passport_number || parsed.passport_no || parsed.pass_num, 'passportNumber'),
-                passportExpiryDate: extractField(parsed.passport_expiry_date || parsed.expiry_date, 'passportExpiryDate'),
-
-                // Visa fields
-                visaNumber: extractField(parsed.visa_number || parsed.visa_no || parsed.visa_num, 'visaNumber'),
-                visaType: extractField(parsed.visa_type, 'visaType', 'TOURIST'),
-                visaIssueDate: extractField(parsed.visa_issue_date || parsed.issue_date, 'visaIssueDate'),
-                visaExpiryDate: extractField(parsed.visa_expiry_date, 'visaExpiryDate'),
-                visaPlaceOfIssue: extractField(parsed.visa_place_of_issue || parsed.place_of_issue, 'visaPlaceOfIssue'),
-
-                // Stamp fields
-                arrivalDateIndia: extractField(parsed.arrival_date_india || parsed.arrival_date, 'arrivalDateIndia'),
-                arrivalPortIndia: extractField(parsed.arrival_port_india || parsed.arrival_port, 'arrivalPortIndia'),
-
-                // Form-C Arrival Report fields
-                permanentAddress: extractField(parsed.permanent_address || parsed.full_address, 'permanentAddress'),
-                city: extractField(parsed.city, 'city'),
-                country: extractField(parsed.country, 'country'),
-                contactEmail: extractField(parsed.contact_email || parsed.email, 'contactEmail'),
-                contactPhone: extractField(parsed.contact_phone || parsed.telephone_mobile, 'contactPhone'),
-                arrivalDatetimeHomestay: extractField(parsed.arrival_datetime_homestay || parsed.datetime_arrival_homestay, 'arrivalDatetimeHomestay'),
-                arrivedFrom: extractField(parsed.arrived_from || parsed.arri_from, 'arrivedFrom'),
-                proceedingTo: extractField(parsed.proceeding_to || parsed.proc_to, 'proceedingTo'),
-                stayDurationIndia: extractField(parsed.stay_duration_india || parsed.proposed_duration_stay_india, 'stayDurationIndia'),
-                purposeOfVisit: extractField(parsed.purpose_of_visit || parsed.purpose_of_visit_profession, 'purposeOfVisit', 'Tourism'),
-                expectedDepartureDate: extractField(parsed.expected_departure_date || parsed.expected_date_departure, 'expectedDepartureDate'),
-                arrivedCountryCityIndia: extractField(parsed.arrived_country_city_india || parsed.country_city_arrived_to_india, 'arrivedCountryCityIndia'),
-              });
-
-              setMetadata(metaMap);
-            } catch (err) {
-              console.warn('[ReviewScreen] Could not parse extracted JSON payload:', err);
-            }
-          }
-        }
-      } catch (error: any) {
-        Alert.alert('Load Error', error.message || 'Failed to load submission data.');
-      } finally {
-        setLoading(false);
-      }
-    };
-
-    loadDocumentData();
-  }, [submissionId]);
-
-  /**
-   * Updates specific field value in state and tags it as manually verified.
-   */
-  const handleFieldChange = (field: keyof CompleteFormCFields, value: string) => {
-    setFormData((prev) => ({ ...prev, [field]: value }));
-    setMetadata((prev) => ({
-      ...prev,
-      [field]: { confidence: 1.0, source: 'manual_edit' },
-    }));
+  const extractVal = (field: any, fallback: string = ''): string => {
+    if (field === null || field === undefined) return fallback;
+    if (typeof field === 'object' && 'value' in field) {
+      return field.value !== null && field.value !== undefined ? String(field.value) : fallback;
+    }
+    return String(field);
   };
 
   /**
-   * Persists verified values back to SQLite and marks submission as 'REVIEWED'.
+   * Loads submission metadata and guest documents from SQLite.
    */
-  const handleSaveAndConfirm = async () => {
+  const loadData = useCallback(async () => {
     try {
-      setIsSaving(true);
+      setLoading(true);
+      const sub = await getSubmissionById(submissionId);
+      setSubmission(sub);
+
       const db = await openDatabase();
-
-      // Wrap values with metadata for consistency
-      const outputPayload: Record<string, any> = {};
-      (Object.keys(formData) as Array<keyof CompleteFormCFields>).forEach((k) => {
-        const val = formData[k];
-        const meta = metadata[k] || { confidence: 1.0, source: 'manual_verification' };
-        outputPayload[k] = {
-          value: val.trim() === '' ? null : val.trim(),
-          confidence: meta.confidence,
-          source: meta.source,
-        };
-      });
-
-      // Persist full JSON into guest_documents table
-      const updatedJson = JSON.stringify(outputPayload);
-      await db.runAsync(
-        `UPDATE guest_documents SET extracted_data_json = ? WHERE submission_id = ?;`,
-        [updatedJson, submissionId]
+      const docs = await db.getAllAsync<GuestDocumentRecord>(
+        'SELECT * FROM guest_documents WHERE submission_id = ? ORDER BY guest_index ASC LIMIT 1;',
+        [submissionId]
       );
 
-      // Advance submission state to REVIEWED
-      await updateSubmissionStatus(submissionId, 'REVIEWED');
+      if (docs && docs.length > 0) {
+        const doc = docs[0];
+        setGuestDoc(doc);
 
-      setIsSaving(false);
-      Alert.alert('Verified', 'Document details verified and marked as REVIEWED.', [
-        { text: 'OK', onPress: onFinishReview },
-      ]);
-    } catch (error: any) {
-      setIsSaving(false);
-      Alert.alert('Save Error', error.message || 'Failed to confirm review.');
+        if (doc.extracted_data_json) {
+          try {
+            const parsed = JSON.parse(doc.extracted_data_json);
+
+            // Check if backend returned isolated containers (Task 45) or flat structure
+            const docsContainer = parsed.documents || {};
+            const pBio = docsContainer.passport_bio || parsed;
+            const vDoc = docsContainer.visa_document || parsed;
+            const vStamp = docsContainer.visa_stamp || parsed;
+            const eStamp = docsContainer.entry_stamp || parsed;
+            const wForm = docsContainer.welcome_form || parsed;
+
+            setFormData({
+              // Passport
+              surname: extractVal(pBio.surname),
+              givenNames: extractVal(pBio.given_names),
+              sex: extractVal(pBio.sex),
+              dateOfBirth: extractVal(pBio.date_of_birth),
+              nationality: extractVal(pBio.nationality),
+              passportNumber: extractVal(pBio.passport_number),
+              passportExpiryDate: extractVal(pBio.passport_expiry_date),
+
+              // Visa (prefer visa_document then visa_stamp then flat)
+              visaNumber: extractVal(vDoc.visa_number || vStamp.visa_number || parsed.visa_number),
+              visaType: extractVal(vDoc.visa_type || vStamp.visa_type || parsed.visa_type, 'TOURIST'),
+              visaIssueDate: extractVal(vDoc.visa_issue_date || vStamp.visa_issue_date || parsed.visa_issue_date),
+              visaExpiryDate: extractVal(vDoc.visa_expiry_date || vStamp.visa_expiry_date || parsed.visa_expiry_date),
+              visaPlaceOfIssue: extractVal(vDoc.visa_place_of_issue || vStamp.visa_place_of_issue || parsed.visa_place_of_issue),
+
+              // Entry Stamp
+              arrivalDateIndia: extractVal(eStamp.arrival_date_india || parsed.arrival_date_india),
+              arrivalPortIndia: extractVal(eStamp.arrival_port_india || parsed.arrival_port_india),
+
+              // Form-C Report (Rows 1-12)
+              permanentAddress: extractVal(wForm.permanent_address || parsed.permanent_address),
+              city: extractVal(wForm.city || parsed.city),
+              country: extractVal(wForm.country || parsed.country),
+              contactEmail: extractVal(wForm.contact_email || parsed.contact_email),
+              contactPhone: extractVal(wForm.contact_phone || parsed.contact_phone),
+              arrivalDatetimeHomestay: extractVal(wForm.arrival_datetime_homestay || parsed.arrival_datetime_homestay),
+              arrivedFrom: extractVal(wForm.arrived_from || parsed.arrived_from),
+              proceedingTo: extractVal(wForm.proceeding_to || parsed.proceeding_to),
+              stayDurationIndia: extractVal(wForm.stay_duration_india || parsed.stay_duration_india),
+              purposeOfVisit: extractVal(wForm.purpose_of_visit || parsed.purpose_of_visit, 'Tourist'),
+              expectedDepartureDate: extractVal(wForm.expected_departure_date || parsed.expected_departure_date),
+              arrivedCountryCityIndia: extractVal(wForm.arrived_country_city_india || parsed.arrived_country_city_india),
+            });
+          } catch (jsonErr) {
+            console.warn('[ReviewScreen] Error parsing extracted_data_json:', jsonErr);
+          }
+        }
+      }
+    } catch (err) {
+      console.warn('[ReviewScreen] Error loading data:', err);
+      Alert.alert('Load Error', 'Failed to retrieve submission details.');
+    } finally {
+      setLoading(false);
     }
-  };
+  }, [submissionId]);
+
+  useEffect(() => {
+    loadData();
+  }, [loadData]);
 
   /**
-   * Resolves active document image path based on selected preview tab.
+   * Resolves the active image URI based on the selected document tab.
+   * Defensively normalizes with '?? null' to prevent undefined assignment errors.
    */
-  const getActiveImageUri = (): string | undefined => {
-    if (!guestDoc) return undefined;
+  const getActiveImageUri = (): string | null => {
+    if (!guestDoc) return null;
     switch (selectedDocTab) {
       case 'passport':
-        return guestDoc.passport_bio_path;
-      case 'visa':
-        return guestDoc.visa_stamp_path;
+        return guestDoc.passport_bio_path ?? null;
+      case 'visa_document':
+        return (guestDoc.visa_document_path || guestDoc.visa_stamp_path) ?? null;
+      case 'visa_stamp':
+        return (guestDoc.visa_stamp_path || guestDoc.visa_document_path) ?? null;
       case 'stamp':
-        return guestDoc.entry_stamp_path;
+        return guestDoc.entry_stamp_path ?? null;
       case 'form_c':
-        return guestDoc.form_c_path;
+        return guestDoc.form_c_path ?? null;
       case 'photo':
-        return guestDoc.guest_photo_path;
+        return guestDoc.guest_photo_path ?? null;
       case 'all':
       default:
-        return guestDoc.passport_bio_path || guestDoc.form_c_path;
+        return guestDoc.passport_bio_path ?? null;
     }
   };
 
   /**
-   * Dynamically filters fields strictly matching the selected tab category.
-   * If 'all' is active, renders every field grouped for portal submission.
+   * Updates an individual field value in the local state.
    */
-  const activeFieldsToRender = useMemo(() => {
-    if (selectedDocTab === 'all') {
-      return FIELD_REGISTRY;
+  const updateField = (key: keyof FormCData, value: string) => {
+    setFormData((prev) => ({ ...prev, [key]: value }));
+  };
+
+  /**
+   * Saves reviewed / edited data to local SQLite.
+   */
+  const handleSave = async (showNotice: boolean = true) => {
+    try {
+      setSaving(true);
+      const updatedPayload = {
+        surname: { value: formData.surname, confidence: 1.0, source: 'manual_edit' },
+        given_names: { value: formData.givenNames, confidence: 1.0, source: 'manual_edit' },
+        sex: { value: formData.sex, confidence: 1.0, source: 'manual_edit' },
+        date_of_birth: { value: formData.dateOfBirth, confidence: 1.0, source: 'manual_edit' },
+        nationality: { value: formData.nationality, confidence: 1.0, source: 'manual_edit' },
+        passport_number: { value: formData.passportNumber, confidence: 1.0, source: 'manual_edit' },
+        passport_expiry_date: { value: formData.passportExpiryDate, confidence: 1.0, source: 'manual_edit' },
+        visa_number: { value: formData.visaNumber, confidence: 1.0, source: 'manual_edit' },
+        visa_type: { value: formData.visaType, confidence: 1.0, source: 'manual_edit' },
+        visa_issue_date: { value: formData.visaIssueDate, confidence: 1.0, source: 'manual_edit' },
+        visa_expiry_date: { value: formData.visaExpiryDate, confidence: 1.0, source: 'manual_edit' },
+        visa_place_of_issue: { value: formData.visaPlaceOfIssue, confidence: 1.0, source: 'manual_edit' },
+        arrival_date_india: { value: formData.arrivalDateIndia, confidence: 1.0, source: 'manual_edit' },
+        arrival_port_india: { value: formData.arrivalPortIndia, confidence: 1.0, source: 'manual_edit' },
+        permanent_address: { value: formData.permanentAddress, confidence: 1.0, source: 'manual_edit' },
+        city: { value: formData.city, confidence: 1.0, source: 'manual_edit' },
+        country: { value: formData.country, confidence: 1.0, source: 'manual_edit' },
+        contact_email: { value: formData.contactEmail, confidence: 1.0, source: 'manual_edit' },
+        contact_phone: { value: formData.contactPhone, confidence: 1.0, source: 'manual_edit' },
+        arrival_datetime_homestay: { value: formData.arrivalDatetimeHomestay, confidence: 1.0, source: 'manual_edit' },
+        arrived_from: { value: formData.arrivedFrom, confidence: 1.0, source: 'manual_edit' },
+        proceeding_to: { value: formData.proceedingTo, confidence: 1.0, source: 'manual_edit' },
+        stay_duration_india: { value: formData.stayDurationIndia, confidence: 1.0, source: 'manual_edit' },
+        purpose_of_visit: { value: formData.purposeOfVisit, confidence: 1.0, source: 'manual_edit' },
+        expected_departure_date: { value: formData.expectedDepartureDate, confidence: 1.0, source: 'manual_edit' },
+        arrived_country_city_india: { value: formData.arrivedCountryCityIndia, confidence: 1.0, source: 'manual_edit' },
+      };
+
+      await updateGuestExtractedData(submissionId, JSON.stringify(updatedPayload));
+      await updateSubmissionStatus(submissionId, 'PENDING_REVIEW');
+
+      if (showNotice) {
+        Alert.alert('Saved', 'Guest Form-C details successfully updated locally.');
+      }
+    } catch (err: any) {
+      Alert.alert('Save Failed', err.message || 'Could not save guest record.');
+    } finally {
+      setSaving(false);
     }
-    if (selectedDocTab === 'photo') {
-      return FIELD_REGISTRY.filter((f) => f.key === 'givenName' || f.key === 'surname');
-    }
-    return FIELD_REGISTRY.filter((f) => f.documentCategory === selectedDocTab);
-  }, [selectedDocTab]);
+  };
 
-  // Confidence badge color helper
-  const renderConfidenceBadge = (fieldKey: keyof CompleteFormCFields) => {
-    const meta = metadata[fieldKey] || { confidence: 0, source: 'unassigned' };
-    const pct = Math.round(meta.confidence * 100);
-
-    let badgeBg = '#FFEBEE';
-    let badgeText = '#C62828';
-    let label = `${pct}% Low`;
-
-    if (meta.source === 'manual_edit' || meta.source === 'manual_verification') {
-      badgeBg = '#E0F2FE';
-      badgeText = '#0284C7';
-      label = 'Edited ✍';
-    } else if (meta.confidence >= 0.85) {
-      badgeBg = '#E8F5E9';
-      badgeText = '#2E7D32';
-      label = `${pct}% High`;
-    } else if (meta.confidence >= 0.50) {
-      badgeBg = '#FFF8E1';
-      badgeText = '#F57F17';
-      label = `${pct}% Med`;
+  /**
+   * Re-submits images to the Dell server for fresh background extraction.
+   */
+  const handleReSubmit = async () => {
+    if (!guestDoc || !guestDoc.passport_bio_path) {
+      Alert.alert('Error', 'Passport bio image is required to initiate extraction.');
+      return;
     }
 
-    return (
-      <View style={[styles.confidenceBadge, { backgroundColor: badgeBg }]}>
-        <Text style={[styles.confidenceBadgeText, { color: badgeText }]}>{label}</Text>
-      </View>
+    try {
+      setReSubmitting(true);
+      // 1. Submit passport bio to initialize new job
+      const submitRes = await submitPassportBio(guestDoc.passport_bio_path);
+      const newJobId = submitRes.job_id;
+
+      // 2. Attach optional secondary captures
+      if (guestDoc.visa_document_path) {
+        await attachDocumentToJob(newJobId, 'visa_document', guestDoc.visa_document_path);
+      }
+      if (guestDoc.visa_stamp_path) {
+        await attachDocumentToJob(newJobId, 'visa_stamp', guestDoc.visa_stamp_path);
+      }
+      if (guestDoc.entry_stamp_path) {
+        await attachDocumentToJob(newJobId, 'entry_stamp', guestDoc.entry_stamp_path);
+      }
+      if (guestDoc.form_c_path) {
+        await attachDocumentToJob(newJobId, 'welcome_form', guestDoc.form_c_path);
+      }
+      if (guestDoc.guest_photo_path) {
+        await attachDocumentToJob(newJobId, 'guest_photo', guestDoc.guest_photo_path);
+      }
+
+      // 3. Trigger worker
+      await startJobProcessing(newJobId);
+
+      // 4. Update local SQLite status
+      const db = await openDatabase();
+      await db.runAsync('UPDATE submissions SET status = ?, job_id = ? WHERE id = ?;', [
+        'PROCESSING',
+        newJobId,
+        submissionId,
+      ]);
+      await db.runAsync('UPDATE guest_documents SET extracted_data_json = NULL WHERE submission_id = ?;', [
+        submissionId,
+      ]);
+
+      Alert.alert(
+        'Re-Submitted',
+        'Documents re-submitted to the server. Processing has restarted.',
+        [{ text: 'OK', onPress: onComplete }]
+      );
+    } catch (err: any) {
+      Alert.alert('Re-submission Error', err.message || 'Failed to dispatch to server.');
+    } finally {
+      setReSubmitting(false);
+    }
+  };
+
+  /**
+   * Permanently deletes submission on mobile and cascades purge on Dell edge server (Task 44).
+   */
+  const handleDeleteSubmission = () => {
+    Alert.alert(
+      'Delete Submission',
+      'Are you sure you want to delete this submission? All captured images and extracted records will be permanently removed from this device and the server.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              setDeleting(true);
+              await deleteSubmissionLocallyAndRemote(submissionId);
+              Alert.alert('Deleted', 'Submission and associated files permanently purged.', [
+                { text: 'OK', onPress: onComplete },
+              ]);
+            } catch (err: any) {
+              Alert.alert('Delete Failed', err.message || 'Could not delete submission.');
+            } finally {
+              setDeleting(false);
+            }
+          },
+        },
+      ]
     );
   };
 
+  /**
+   * Concludes the mobile lifecycle (Task 43: Review & Re-submit only).
+   */
+  const handleCompleteReview = async () => {
+    await handleSave(false);
+    onComplete();
+  };
+
+  // Helper to render an outlined editable text input
+  const renderField = (label: string, fieldKey: keyof FormCData, placeholder: string = '') => (
+    <View style={styles.fieldContainer} key={fieldKey}>
+      <Text style={[styles.fieldLabel, { color: colors.textMuted }]}>{label}</Text>
+      <TextInput
+        style={[
+          styles.fieldInput,
+          {
+            color: colors.textPrimary,
+            backgroundColor: isDark ? '#1E293B' : '#F8FAFC',
+            borderColor: colors.border,
+          },
+        ]}
+        value={formData[fieldKey]}
+        onChangeText={(text) => updateField(fieldKey, text)}
+        placeholder={placeholder}
+        placeholderTextColor={colors.textMuted}
+      />
+    </View>
+  );
+
   if (loading) {
     return (
-      <View style={[styles.centerContainer, { backgroundColor: colors.background }]}>
+      <View style={[styles.loadingContainer, { backgroundColor: colors.background }]}>
         <ActivityIndicator size="large" color={colors.primaryBrand} />
+        <Text style={[styles.loadingText, { color: colors.textPrimary }]}>Loading submission...</Text>
       </View>
     );
   }
 
-  const activeImage = getActiveImageUri();
+  const activeImageUri = getActiveImageUri();
 
   return (
-    <View style={[styles.container, { backgroundColor: colors.background }]}>
-      <KeyboardAvoidingView
-        style={styles.keyboardContainer}
-        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-      >
-        {/* Top Header Bar */}
-        <View style={[styles.headerBar, { backgroundColor: colors.surface, borderBottomColor: colors.border }]}>
-          <TouchableOpacity onPress={onCancel} style={styles.headerButton}>
-            <Text style={[styles.headerButtonText, { color: colors.textMuted }]}>Close</Text>
-          </TouchableOpacity>
-          <Text style={[styles.headerTitle, { color: colors.textPrimary }]}>Verify Document</Text>
-          <TouchableOpacity onPress={toggleTheme} style={styles.themeToggle}>
-            <Text style={styles.themeToggleText}>{isDark ? '☀️' : '🌙'}</Text>
-          </TouchableOpacity>
-        </View>
+    <SafeAreaView style={[styles.container, { backgroundColor: colors.background }]}>
+      {/* --- Header Bar --- */}
+      <View style={[styles.header, { borderBottomColor: colors.border }]}>
+        <TouchableOpacity onPress={onBack} style={styles.backButton}>
+          <Text style={[styles.backButtonText, { color: colors.primaryBrand }]}>← Back</Text>
+        </TouchableOpacity>
+        <Text style={[styles.headerTitle, { color: colors.textPrimary }]}>Review & Verify</Text>
+        <TouchableOpacity
+          onPress={handleDeleteSubmission}
+          style={styles.deleteHeaderButton}
+          disabled={deleting}
+        >
+          {deleting ? (
+            <ActivityIndicator size="small" color="#EF4444" />
+          ) : (
+            <Text style={styles.deleteHeaderText}>🗑 Delete</Text>
+          )}
+        </TouchableOpacity>
+      </View>
 
-        {/* Top 42%: Pinch-to-Zoom Document Preview */}
-        <View style={[styles.imageViewerSection, { backgroundColor: colors.surfaceSubtle }]}>
-          {/* Document Switcher Tabs */}
-          <View style={styles.tabRow}>
-            {(['passport', 'visa', 'stamp', 'form_c', 'photo', 'all'] as const).map((tabKey) => (
-              <TouchableOpacity
-                key={tabKey}
-                onPress={() => setSelectedDocTab(tabKey)}
-                style={[
-                  styles.tabButton,
-                  {
-                    borderBottomColor:
-                      selectedDocTab === tabKey ? colors.primaryBrand : 'transparent',
-                  },
-                ]}
-              >
-                <Text
-                  style={[
-                    styles.tabButtonText,
-                    {
-                      color: selectedDocTab === tabKey ? colors.primaryBrand : colors.textMuted,
-                      fontWeight: selectedDocTab === tabKey ? '700' : '500',
-                    },
-                  ]}
-                >
-                  {tabKey === 'form_c' ? 'FORM-C' : tabKey === 'all' ? '★ ALL' : tabKey.toUpperCase()}
-                </Text>
-              </TouchableOpacity>
-            ))}
-          </View>
-
-          {/* Pinch-to-Zoom Scroll Container */}
-          <View style={styles.imageWrapper}>
-            {activeImage ? (
-              <ScrollView
-                style={styles.zoomScrollView}
-                contentContainerStyle={styles.zoomContentContainer}
-                maximumZoomScale={4.0}
-                minimumZoomScale={1.0}
-                showsHorizontalScrollIndicator={false}
-                showsVerticalScrollIndicator={false}
-                centerContent={true}
-              >
-                <Image
-                  source={{ uri: activeImage.startsWith('file://') ? activeImage : `file://${activeImage}` }}
-                  style={styles.previewImage}
-                  resizeMode="contain"
-                />
-              </ScrollView>
-            ) : (
-              <View style={styles.emptyImageContainer}>
-                <Text style={[styles.emptyImageText, { color: colors.textMuted }]}>
-                  No image scan attached for this document stage
-                </Text>
-              </View>
-            )}
-            <View style={styles.zoomHintBadge}>
-              <Text style={styles.zoomHintText}>🔍 Pinch to zoom</Text>
-            </View>
-          </View>
-        </View>
-
-        {/* Bottom 58%: Strictly Isolated Form Fields Matching Active Tab */}
-        <ScrollView contentContainerStyle={styles.formContent} keyboardShouldPersistTaps="handled">
-          <View style={styles.sectionHeaderRow}>
-            <Text style={[styles.sectionHeading, { color: colors.primaryBrand }]}>
-              {selectedDocTab === 'all'
-                ? '★ Complete Form-C Master Record'
-                : selectedDocTab === 'photo'
-                ? '👤 Passport Portrait Verification'
-                : `Extracted from ${selectedDocTab.toUpperCase()} Scan`}
-            </Text>
-            <Text style={[styles.sectionCountText, { color: colors.textMuted }]}>
-              {activeFieldsToRender.length} Field(s)
-            </Text>
-          </View>
-
-          {/* Render Only Fields Belonging to the Active Category */}
-          {activeFieldsToRender.map((descriptor) => {
-            const meta = metadata[descriptor.key] || { confidence: 0, source: 'unassigned' };
-            return (
-              <View style={styles.fieldGroup} key={descriptor.key}>
-                <View style={styles.labelRow}>
-                  <Text style={[styles.label, { color: colors.textMuted }]}>
-                    {descriptor.label}
-                  </Text>
-                  {renderConfidenceBadge(descriptor.key)}
-                </View>
-
-                <TextInput
-                  style={[
-                    styles.input,
-                    {
-                      backgroundColor: colors.surface,
-                      color: colors.textPrimary,
-                      borderColor: colors.border,
-                    },
-                  ]}
-                  value={formData[descriptor.key]}
-                  onChangeText={(text) => handleFieldChange(descriptor.key, text)}
-                  placeholder={descriptor.placeholder}
-                  placeholderTextColor={colors.textMuted}
-                  autoCapitalize={descriptor.autoCapitalize || 'sentences'}
-                />
-
-                <Text style={styles.sourceCaption}>
-                  Source: {meta.source}
-                </Text>
-              </View>
-            );
-          })}
-
-          {/* Confirm & Save Button */}
-          <TouchableOpacity
-            disabled={isSaving}
-            onPress={handleSaveAndConfirm}
-            style={[styles.confirmButton, { backgroundColor: colors.statusReady }]}
+      {/* --- Top 38%: Pinch-to-Zoom Document Preview --- */}
+      <View style={[styles.imageViewerPane, { backgroundColor: isDark ? '#000000' : '#F1F5F9' }]}>
+        {activeImageUri ? (
+          <ScrollView
+            maximumZoomScale={4.0}
+            minimumZoomScale={1.0}
+            showsHorizontalScrollIndicator={false}
+            showsVerticalScrollIndicator={false}
+            contentContainerStyle={styles.zoomContent}
           >
-            {isSaving ? (
-              <ActivityIndicator color="#FFFFFF" />
-            ) : (
-              <Text style={styles.confirmButtonText}>Save & Confirm Form-C Record ✓</Text>
-            )}
-          </TouchableOpacity>
+            <Image source={{ uri: activeImageUri }} style={styles.previewImage} resizeMode="contain" />
+          </ScrollView>
+        ) : (
+          <View style={styles.noImagePlaceholder}>
+            <Text style={[styles.noImageText, { color: colors.textMuted }]}>
+              No document image attached for this section.
+            </Text>
+          </View>
+        )}
+        <View style={styles.zoomHintBadge}>
+          <Text style={styles.zoomHintText}>🔍 Pinch to zoom</Text>
+        </View>
+      </View>
 
-          <View style={{ height: 40 }} />
-        </ScrollView>
-      </KeyboardAvoidingView>
-    </View>
+      {/* --- Document Selector Tabs (Task 42: Dual Visa Support) --- */}
+      <ScrollView
+        horizontal
+        showsHorizontalScrollIndicator={false}
+        style={[styles.tabsBar, { backgroundColor: colors.surface }]}
+        contentContainerStyle={styles.tabsContainer}
+      >
+        <TouchableOpacity
+          style={[styles.tabButton, selectedDocTab === 'passport' && { backgroundColor: colors.primaryBrand }]}
+          onPress={() => setSelectedDocTab('passport')}
+        >
+          <Text style={[styles.tabButtonText, selectedDocTab === 'passport' ? styles.tabActiveText : { color: colors.textMuted }]}>
+            Passport
+          </Text>
+        </TouchableOpacity>
+
+        {guestDoc?.visa_document_path && (
+          <TouchableOpacity
+            style={[styles.tabButton, selectedDocTab === 'visa_document' && { backgroundColor: colors.primaryBrand }]}
+            onPress={() => setSelectedDocTab('visa_document')}
+          >
+            <Text style={[styles.tabButtonText, selectedDocTab === 'visa_document' ? styles.tabActiveText : { color: colors.textMuted }]}>
+              Visa Doc (A4)
+            </Text>
+          </TouchableOpacity>
+        )}
+
+        {guestDoc?.visa_stamp_path && (
+          <TouchableOpacity
+            style={[styles.tabButton, selectedDocTab === 'visa_stamp' && { backgroundColor: colors.primaryBrand }]}
+            onPress={() => setSelectedDocTab('visa_stamp')}
+          >
+            <Text style={[styles.tabButtonText, selectedDocTab === 'visa_stamp' ? styles.tabActiveText : { color: colors.textMuted }]}>
+              Visa Stamp
+            </Text>
+          </TouchableOpacity>
+        )}
+
+        <TouchableOpacity
+          style={[styles.tabButton, selectedDocTab === 'stamp' && { backgroundColor: colors.primaryBrand }]}
+          onPress={() => setSelectedDocTab('stamp')}
+        >
+          <Text style={[styles.tabButtonText, selectedDocTab === 'stamp' ? styles.tabActiveText : { color: colors.textMuted }]}>
+            Entry Stamp
+          </Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          style={[styles.tabButton, selectedDocTab === 'form_c' && { backgroundColor: colors.primaryBrand }]}
+          onPress={() => setSelectedDocTab('form_c')}
+        >
+          <Text style={[styles.tabButtonText, selectedDocTab === 'form_c' ? styles.tabActiveText : { color: colors.textMuted }]}>
+            Form-C Slip
+          </Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          style={[styles.tabButton, selectedDocTab === 'all' && { backgroundColor: colors.primaryBrand }]}
+          onPress={() => setSelectedDocTab('all')}
+        >
+          <Text style={[styles.tabButtonText, selectedDocTab === 'all' ? styles.tabActiveText : { color: colors.textMuted }]}>
+            All Fields
+          </Text>
+        </TouchableOpacity>
+      </ScrollView>
+
+      {/* --- Bottom 60%: Tab-Scoped Editable Form Fields --- */}
+      <ScrollView style={styles.fieldsScroll} contentContainerStyle={styles.fieldsContainer}>
+        {/* PASSPORT FIELDS */}
+        {(selectedDocTab === 'passport' || selectedDocTab === 'all') && (
+          <View style={styles.formSection}>
+            <Text style={[styles.sectionHeading, { color: colors.primaryBrand }]}>Passport Bio-Data</Text>
+            {renderField('Surname (Family Name)', 'surname')}
+            {renderField('Given Name(s)', 'givenNames')}
+            {renderField('Passport Number', 'passportNumber')}
+            {renderField('Nationality', 'nationality')}
+            {renderField('Date of Birth (YYYY-MM-DD)', 'dateOfBirth')}
+            {renderField('Sex (M / F / X)', 'sex')}
+            {renderField('Passport Expiry Date (YYYY-MM-DD)', 'passportExpiryDate')}
+          </View>
+        )}
+
+        {/* VISA FIELDS (Task 42) */}
+        {(selectedDocTab === 'visa_document' || selectedDocTab === 'visa_stamp' || selectedDocTab === 'all') && (
+          <View style={styles.formSection}>
+            <Text style={[styles.sectionHeading, { color: colors.primaryBrand }]}>
+              {selectedDocTab === 'visa_document' ? 'e-Visa Document Details' : 'Visa Stamp / Sticker Details'}
+            </Text>
+            {renderField('Visa Number', 'visaNumber')}
+            {renderField('Visa Type', 'visaType')}
+            {renderField('Issue Date (YYYY-MM-DD)', 'visaIssueDate')}
+            {renderField('Expiry Date (YYYY-MM-DD)', 'visaExpiryDate')}
+            {renderField('Place of Issue / Authority', 'visaPlaceOfIssue')}
+          </View>
+        )}
+
+        {/* ENTRY STAMP FIELDS */}
+        {(selectedDocTab === 'stamp' || selectedDocTab === 'all') && (
+          <View style={styles.formSection}>
+            <Text style={[styles.sectionHeading, { color: colors.primaryBrand }]}>Immigration Arrival Stamp</Text>
+            {renderField('Date of Arrival in India (YYYY-MM-DD)', 'arrivalDateIndia')}
+            {renderField('Port or Airport of Arrival', 'arrivalPortIndia')}
+          </View>
+        )}
+
+        {/* FORM-C HANDWRITTEN SLIP FIELDS (Rows 1-12) */}
+        {(selectedDocTab === 'form_c' || selectedDocTab === 'all') && (
+          <View style={styles.formSection}>
+            <Text style={[styles.sectionHeading, { color: colors.primaryBrand }]}>Form-C Arrival Report (Rows 1-12)</Text>
+            {renderField('Row 2: Full Permanent Street Address', 'permanentAddress')}
+            {renderField('Row 2: Home City / Town', 'city')}
+            {renderField('Row 2: Home Country', 'country')}
+            {renderField('Row 2: Contact Email', 'contactEmail')}
+            {renderField('Row 2: Telephone / Mobile', 'contactPhone')}
+            {renderField('Row 6: Date & Time of Arrival in Homestay', 'arrivalDatetimeHomestay')}
+            {renderField('Row 7: Arrived From', 'arrivedFrom')}
+            {renderField('Row 8: Proceeding To', 'proceedingTo')}
+            {renderField('Row 9: Proposed Stay Duration in India', 'stayDurationIndia')}
+            {renderField('Row 10: Purpose of Visit & Profession', 'purposeOfVisit')}
+            {renderField('Row 11: Expected Date of Departure', 'expectedDepartureDate')}
+            {renderField('Row 12: Country & City Arrived to India', 'arrivedCountryCityIndia')}
+          </View>
+        )}
+      </ScrollView>
+
+      {/* --- Action Bar (Task 43: Review & Re-Submit Only - Portal Submit Removed) --- */}
+      <View style={[styles.actionBar, { borderTopColor: colors.border, backgroundColor: colors.background }]}>
+        <TouchableOpacity
+          style={[styles.reSubmitButton, { borderColor: colors.primaryBrand }]}
+          onPress={handleReSubmit}
+          disabled={reSubmitting}
+        >
+          {reSubmitting ? (
+            <ActivityIndicator size="small" color={colors.primaryBrand} />
+          ) : (
+            <Text style={[styles.reSubmitButtonText, { color: colors.primaryBrand }]}>⟳ Re-submit</Text>
+          )}
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          style={[styles.saveButton, { backgroundColor: isDark ? '#334155' : '#E2E8F0' }]}
+          onPress={() => handleSave(true)}
+          disabled={saving}
+        >
+          {saving ? (
+            <ActivityIndicator size="small" color={colors.textPrimary} />
+          ) : (
+            <Text style={[styles.saveButtonText, { color: colors.textPrimary }]}>💾 Save</Text>
+          )}
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          style={[styles.completeButton, { backgroundColor: colors.primaryBrand }]}
+          onPress={handleCompleteReview}
+        >
+          <Text style={styles.completeButtonText}>✓ Done</Text>
+        </TouchableOpacity>
+      </View>
+    </SafeAreaView>
   );
 };
 
@@ -557,167 +643,179 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
   },
-  keyboardContainer: {
+  loadingContainer: {
     flex: 1,
-  },
-  centerContainer: {
-    flex: 1,
-    alignItems: 'center',
     justifyContent: 'center',
+    alignItems: 'center',
   },
-  headerBar: {
-    height: 56,
+  loadingText: {
+    marginTop: 12,
+    fontSize: 14,
+  },
+  header: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
     paddingHorizontal: 16,
+    paddingVertical: 12,
     borderBottomWidth: 1,
+  },
+  backButton: {
+    paddingVertical: 6,
+    paddingHorizontal: 8,
+  },
+  backButtonText: {
+    fontSize: 16,
+    fontWeight: '600',
   },
   headerTitle: {
-    fontSize: 17,
+    fontSize: 18,
     fontWeight: '700',
   },
-  headerButton: {
-    padding: 6,
+  deleteHeaderButton: {
+    paddingVertical: 6,
+    paddingHorizontal: 8,
   },
-  headerButtonText: {
-    fontSize: 15,
+  deleteHeaderText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#EF4444',
   },
-  themeToggle: {
-    padding: 6,
-  },
-  themeToggleText: {
-    fontSize: 18,
-  },
-  imageViewerSection: {
-    height: '42%',
-    borderBottomWidth: 1,
-    borderBottomColor: '#CBD5E1',
+  imageViewerPane: {
+    height: Dimensions.get('window').height * 0.38,
     position: 'relative',
+    overflow: 'hidden',
   },
-  tabRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-around',
-    height: 40,
-    borderBottomWidth: 1,
-    borderBottomColor: '#CBD5E1',
-  },
-  tabButton: {
-    justifyContent: 'center',
-    alignItems: 'center',
-    paddingHorizontal: 6,
-    borderBottomWidth: 2,
-  },
-  tabButtonText: {
-    fontSize: 11,
-  },
-  imageWrapper: {
-    flex: 1,
-    position: 'relative',
-  },
-  zoomScrollView: {
-    flex: 1,
-  },
-  zoomContentContainer: {
-    width: SCREEN_WIDTH,
-    minHeight: '100%',
+  zoomContent: {
+    flexGrow: 1,
     justifyContent: 'center',
     alignItems: 'center',
   },
   previewImage: {
-    width: SCREEN_WIDTH,
-    height: 220,
+    width: Dimensions.get('window').width,
+    height: '100%',
   },
-  emptyImageContainer: {
+  noImagePlaceholder: {
     flex: 1,
-    alignItems: 'center',
     justifyContent: 'center',
-    paddingHorizontal: 24,
+    alignItems: 'center',
+    padding: 24,
   },
-  emptyImageText: {
-    fontSize: 13,
+  noImageText: {
+    fontSize: 14,
     textAlign: 'center',
   },
   zoomHintBadge: {
     position: 'absolute',
     bottom: 8,
-    right: 8,
-    backgroundColor: 'rgba(0, 0, 0, 0.65)',
+    right: 12,
+    backgroundColor: 'rgba(0,0,0,0.6)',
     paddingHorizontal: 8,
-    paddingVertical: 3,
-    borderRadius: 4,
+    paddingVertical: 4,
+    borderRadius: 6,
   },
   zoomHintText: {
     color: '#FFFFFF',
-    fontSize: 10,
+    fontSize: 11,
+    fontWeight: '500',
+  },
+  tabsBar: {
+    maxHeight: 48,
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(0,0,0,0.06)',
+  },
+  tabsContainer: {
+    paddingHorizontal: 12,
+    alignItems: 'center',
+  },
+  tabButton: {
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 20,
+    marginRight: 8,
+    backgroundColor: 'rgba(0,0,0,0.04)',
+  },
+  tabButtonText: {
+    fontSize: 13,
     fontWeight: '600',
   },
-  formContent: {
-    padding: 16,
-    paddingBottom: 48,
+  tabActiveText: {
+    color: '#FFFFFF',
   },
-  sectionHeaderRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: 12,
+  fieldsScroll: {
+    flex: 1,
+  },
+  fieldsContainer: {
+    padding: 16,
+    paddingBottom: 32,
+  },
+  formSection: {
+    marginBottom: 20,
   },
   sectionHeading: {
     fontSize: 15,
     fontWeight: '700',
+    marginBottom: 12,
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
   },
-  sectionCountText: {
-    fontSize: 12,
-    fontWeight: '500',
-  },
-  fieldGroup: {
+  fieldContainer: {
     marginBottom: 14,
   },
-  labelRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: 4,
-  },
-  label: {
+  fieldLabel: {
     fontSize: 12,
     fontWeight: '600',
-    flex: 1,
+    marginBottom: 4,
   },
-  confidenceBadge: {
-    paddingHorizontal: 6,
-    paddingVertical: 2,
-    borderRadius: 4,
-    marginLeft: 8,
-  },
-  confidenceBadgeText: {
-    fontSize: 10,
-    fontWeight: '700',
-  },
-  input: {
-    height: 44,
+  fieldInput: {
+    borderWidth: 1,
     borderRadius: 8,
     paddingHorizontal: 12,
-    borderWidth: 1,
-    fontSize: 14,
+    paddingVertical: 10,
+    fontSize: 15,
   },
-  sourceCaption: {
-    fontSize: 10,
-    color: '#94A3B8',
-    marginTop: 2,
-    textAlign: 'right',
+  actionBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    borderTopWidth: 1,
+    gap: 8,
   },
-  confirmButton: {
-    height: 50,
+  reSubmitButton: {
+    flex: 1,
+    borderWidth: 1.5,
     borderRadius: 8,
+    paddingVertical: 12,
     alignItems: 'center',
     justifyContent: 'center',
-    marginTop: 18,
-    marginBottom: 16,
   },
-  confirmButtonText: {
+  reSubmitButtonText: {
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  saveButton: {
+    flex: 1,
+    borderRadius: 8,
+    paddingVertical: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  saveButtonText: {
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  completeButton: {
+    flex: 1.2,
+    borderRadius: 8,
+    paddingVertical: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  completeButtonText: {
     color: '#FFFFFF',
-    fontSize: 15,
+    fontSize: 14,
     fontWeight: '700',
   },
 });
